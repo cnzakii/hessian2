@@ -1,0 +1,92 @@
+name: Coverage
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: interop/go/go.mod
+      - run: uv sync --locked
+      - run: make interop-java
+      - name: Measure Python package coverage
+        run: >-
+          uv run --locked pytest --cov=hessian2 --cov-branch
+          --cov-report=term-missing --cov-report=xml:target/coverage/python.xml
+          --cov-report=html:target/coverage/python-html
+      - name: Upload Python coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: true
+          files: target/coverage/python.xml
+          flags: python
+          disable_search: true
+          fail_ci_if_error: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: python-coverage
+          path: target/coverage/
+          if-no-files-found: error
+
+  rust:
+    name: Rust core coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action
+        with:
+          components: llvm-tools-preview
+      - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Measure Rust core coverage
+        run: |
+          mkdir -p target/coverage
+          cargo llvm-cov -p hessian2-core --locked --html
+          cargo llvm-cov report -p hessian2-core --lcov --output-path target/coverage/rust.lcov
+      - name: Upload Rust core coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: true
+          files: target/coverage/rust.lcov
+          flags: rust
+          disable_search: true
+          fail_ci_if_error: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: rust-core-coverage
+          path: |
+            target/coverage/rust.lcov
+            target/llvm-cov/html/
+          if-no-files-found: error

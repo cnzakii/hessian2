@@ -1,0 +1,4 @@
+interface:
+  display_name: "hessian2 Knowledge"
+  short_description: "Verify Hessian engineering facts from sources"
+  default_prompt: "Use $hessian2-knowledge to verify this Hessian engineering claim from primary sources."

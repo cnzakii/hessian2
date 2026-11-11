@@ -1,0 +1,4 @@
+interface:
+  display_name: "hessian2 Implementation"
+  short_description: "Implement focused hessian2 changes safely"
+  default_prompt: "Use $hessian2-implementation to implement this hessian2 change and verify it."

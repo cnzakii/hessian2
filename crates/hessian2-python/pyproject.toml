@@ -1,0 +1,59 @@
+[build-system]
+requires = ["maturin>=1.15.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hessian2"
+dynamic = ["version"]
+description = "Fast Hessian 2.0 serialization for Python, with a Rust core."
+readme = "../../README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["hessian", "hessian2", "serialization", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/cnzakii/hessian2"
+Repository = "https://github.com/cnzakii/hessian2"
+Documentation = "https://github.com/cnzakii/hessian2#readme"
+Issues = "https://github.com/cnzakii/hessian2/issues"
+Changelog = "https://github.com/cnzakii/hessian2/blob/main/CHANGELOG.md"
+Security = "https://github.com/cnzakii/hessian2/security/policy"
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "hessian2._core"
+python-source = "python"
+exclude = [
+    "python/**/__pycache__",
+    "python/**/*.pyc",
+    "python/**/*.pyo",
+]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../hessian2-core/Cargo.toml" },
+    { file = "../hessian2-core/src/**/*.rs" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+]

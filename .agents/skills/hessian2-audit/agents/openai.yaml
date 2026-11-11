@@ -1,0 +1,4 @@
+interface:
+  display_name: "hessian2 Audit"
+  short_description: "Review hessian2 for evidence-backed defects"
+  default_prompt: "Use $hessian2-audit to review the current hessian2 changes for defects and unnecessary complexity."

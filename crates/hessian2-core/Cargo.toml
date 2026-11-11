@@ -1,0 +1,16 @@
+[package]
+name = "hessian2-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hessian 2.0 serialization primitives: a pull reader and a writer"
+readme = "README.md"
+documentation = "https://docs.rs/hessian2-core"
+repository = "https://github.com/cnzakii/hessian2"
+homepage = "https://github.com/cnzakii/hessian2"
+publish = true
+keywords = ["hessian", "hessian2", "serialization", "binary"]
+categories = ["encoding"]
+
+[dependencies]

@@ -1,0 +1,64 @@
+[dependency-groups]
+dev = [
+    { include-group = "lint" },
+    { include-group = "test" },
+    "maturin>=1.15.0,<2.0",
+]
+lint = [
+    "ruff>=0.17.3,<0.18",
+    "ty>=0.0.94,<0.1",
+]
+bench = [
+    "msgpack>=1.1.0",
+    "orjson>=3.11.0",
+    "pyperf>=2.9.0",
+]
+test = [
+    "attrs>=25.4.0",
+    "hypothesis>=6.140.0",
+    "pytest>=9.2.0,<10",
+    "pytest-cov>=7,<8",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["crates/hessian2-python"]
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle: import, statement, and syntax errors.
+    "E4",
+    "E7",
+    "E9",
+    # Pyflakes: undefined names, unused imports, and related errors.
+    "F",
+    # isort: import grouping and ordering.
+    "I",
+    # pyupgrade: syntax supported by the minimum Python version.
+    "UP",
+    # flake8-bugbear: likely bugs and fragile patterns.
+    "B",
+    # flake8-simplify: unnecessarily complex expressions and control flow.
+    "SIM",
+    # flake8-pyi: correctness and style of published type stubs.
+    "PYI",
+    # Ruff: stale noqa directives.
+    "RUF100",
+]
+
+[tool.ty.src]
+include = ["crates/hessian2-python/python"]
+
+[tool.ty.environment]
+root = ["crates/hessian2-python/python"]
+
+[tool.pytest]
+minversion = "9.0"
+testpaths = ["crates/hessian2-python/tests"]
+strict_config = true
+strict_markers = true
+strict_parametrization_ids = true
+strict_xfail = true
+filterwarnings = ["error"]

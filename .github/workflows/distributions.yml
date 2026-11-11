@@ -1,0 +1,103 @@
+name: Distribution builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distributions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheels:
+    name: ${{ matrix.os }} / CPython ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action
+      - run: uv sync --locked
+      - name: Read locked build-tool version
+        id: maturin
+        shell: bash
+        run: |
+          version="$(uv run --locked maturin --version)"
+          echo "version=v${version#maturin }" >> "$GITHUB_OUTPUT"
+      - name: Build a wheel from the source archive
+        if: runner.os != 'Linux'
+        run: >-
+          uv run --locked maturin build --release --locked --sdist
+          --manifest-path crates/hessian2-python/Cargo.toml --out target/dist
+      - name: Select the manylinux interpreter
+        if: runner.os == 'Linux'
+        id: linux-python
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          case "$PYTHON_VERSION" in
+            3.11) abi=cp311-cp311 ;;
+            3.12) abi=cp312-cp312 ;;
+            3.13) abi=cp313-cp313 ;;
+            3.14) abi=cp314-cp314 ;;
+            3.14t) abi=cp314-cp314t ;;
+            *) exit 1 ;;
+          esac
+          echo "path=/opt/python/$abi/bin/python" >> "$GITHUB_OUTPUT"
+      - name: Build a manylinux wheel from the source archive
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: ${{ steps.maturin.outputs.version }}
+          rust-toolchain: stable
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2014"
+          args: >-
+            --release --locked --sdist --compatibility pypi
+            --manifest-path crates/hessian2-python/Cargo.toml
+            --interpreter ${{ steps.linux-python.outputs.path }} --out target/dist
+      - name: Install the distribution into a clean environment
+        shell: bash
+        run: |
+          uv venv --python '${{ matrix.python }}' target/wheel-test
+          if [ '${{ runner.os }}' = Windows ]; then
+            python=target/wheel-test/Scripts/python.exe
+          else
+            python=target/wheel-test/bin/python
+          fi
+          uv export --locked --only-group test --no-emit-workspace --output-file target/wheel-test-requirements.txt
+          uv pip install --python "$python" target/dist/*.whl -r target/wheel-test-requirements.txt
+          "$python" -m pytest -q -p no:cacheprovider crates/hessian2-python/tests
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distributions-${{ matrix.os }}-${{ matrix.python }}
+          path: target/dist/*
+          if-no-files-found: error
+
+  crate:
+    name: Rust crate archive
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action
+        with:
+          toolchain: "1.88.0"
+      - run: cargo package -p hessian2-core --locked
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-crate
+          path: target/package/*.crate
+          if-no-files-found: error

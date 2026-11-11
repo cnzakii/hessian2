@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/hessian2-core", "crates/hessian2-python"]
+exclude = ["fuzz"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+# Whole-program optimization for the published library and extension.
+[profile.release]
+lto = "fat"
+codegen-units = 1
