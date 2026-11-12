@@ -4,6 +4,8 @@ User-visible changes to hessian2 are recorded here.
 
 ## Unreleased
 
+## [0.1.0] - 2026-11-12
+
 ### Added
 
 - Python: Hessian 2.0 serialization through `dumps`, `loads`, `dumps_many`,
