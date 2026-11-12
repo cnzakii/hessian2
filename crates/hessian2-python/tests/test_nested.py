@@ -19,18 +19,20 @@ from hessian2 import Codec, DecodeError, EncodeError, HessianObject
 @pytest.mark.parametrize("field_naming", [None, "camelCase"])
 @pytest.mark.parametrize("container", [list, dict, tuple])
 def test_nested_dataclasses_and_container_aliases(field_naming, container):
-    codec = Codec(field_naming=field_naming)
+    codec = Codec()
 
-    @codec.register("Child")
     @dataclass(frozen=True, slots=True)
     class Child:
         user_name: str
 
-    @codec.register("Parent")
+    codec.register(Child, name="Child", field_naming=field_naming)
+
     @dataclass
     class Parent:
         first_child: Child
         children: object
+
+    codec.register(Parent, name="Parent", field_naming=field_naming)
 
     child = Child("ann")
     children = {"child": child} if container is dict else container([child, child])
@@ -57,9 +59,10 @@ def test_nested_dataclasses_and_container_aliases(field_naming, container):
 def test_special_types_as_nested_map_keys_and_values(kind):
     codec = Codec()
 
-    @codec.register("Color")
     class Color(Enum):
         RED = 1
+
+    codec.register(Color, name="Color", field_naming=None)
 
     values = {
         "enum": Color.RED,
@@ -86,15 +89,17 @@ def test_special_types_as_nested_map_keys_and_values(kind):
 def test_optional_fields_inside_registered_objects(present):
     codec = Codec()
 
-    @codec.register("Item")
     @dataclass
     class Item:
         value: int
 
-    @codec.register("Optional")
+    codec.register(Item, name="Item", field_naming=None)
+
     @dataclass
     class Optional:
         child: Item | None = None
+
+    codec.register(Optional, name="Optional", field_naming=None)
 
     original = Optional(Item(3) if present else None)
     decoded = codec.loads(codec.dumps([original]))[0]
@@ -111,17 +116,19 @@ def test_nested_missing_defaults_have_independent_factories(factory):
         else attrs.field(factory=list)
     )
 
-    @codec.register("Defaults")
     @factory
     class Defaults:
         value: int = 7
         items: list = items_field
 
-    @codec.register("Pair")
+    codec.register(Defaults, name="Defaults", field_naming=None)
+
     @dataclass
     class Pair:
         left: Defaults
         right: Defaults
+
+    codec.register(Pair, name="Pair", field_naming=None)
 
     wire = Codec().dumps(
         HessianObject(
@@ -153,9 +160,9 @@ def test_inheritance_registration_is_exact(registration):
         age: int
 
     if registration in ("both", "parent"):
-        codec.register("Parent", Parent)
+        codec.register(Parent, name="Parent", field_naming=None)
     if registration in ("both", "child"):
-        codec.register("Child", Child)
+        codec.register(Child, name="Child", field_naming=None)
     for cls, value in [(Parent, Parent("ann")), (Child, Child("bob", 3))]:
         registered = registration in ("both", "parent" if cls is Parent else "child")
         if not registered:
@@ -175,12 +182,13 @@ def test_inheritance_registration_is_exact(registration):
 def test_dataclass_kw_only_init_false_and_classvar(frozen, slots):
     codec = Codec()
 
-    @codec.register("Options")
     @dataclass(frozen=frozen, slots=slots, kw_only=True)
     class Options:
         value: int
         cached: int = field(init=False, default=0)
         category: ClassVar[str] = "static"
+
+    codec.register(Options, name="Options", field_naming=None)
 
     original = Options(value=1)
     object.__setattr__(original, "cached", 42)
@@ -195,11 +203,12 @@ def test_dataclass_kw_only_init_false_and_classvar(frozen, slots):
 def test_initvar_without_post_init_is_not_a_wire_field():
     codec = Codec()
 
-    @codec.register("Input")
     @dataclass
     class Input:
         value: int
         transient: InitVar[int]
+
+    codec.register(Input, name="Input", field_naming=None)
 
     original = Input(1, 99)
     wire = codec.dumps([original])
@@ -212,7 +221,6 @@ def test_initvar_default_is_passed_to_post_init():
     codec = Codec()
     seen = []
 
-    @codec.register("Input")
     @dataclass
     class Input:
         value: int
@@ -220,6 +228,8 @@ def test_initvar_default_is_passed_to_post_init():
 
         def __post_init__(self, transient):
             seen.append(transient)
+
+    codec.register(Input, name="Input", field_naming=None)
 
     original = Input(1)
     decoded = codec.loads(codec.dumps([original]))[0]
@@ -237,7 +247,7 @@ def test_initvar_without_default_cannot_be_registered_with_post_init():
             pass
 
     with pytest.raises(TypeError, match="InitVar without a default"):
-        Codec().register("Input", Input)
+        Codec().register(Input, name="Input", field_naming=None)
 
 
 @pytest.mark.parametrize("decorator", [attrs.define, attrs.frozen])
@@ -255,13 +265,14 @@ def test_attrs_decode_bypasses_converter_validator_but_runs_post_init(decorator,
         if value < 0:
             raise ValueError("negative")
 
-    @codec.register("Attrs")
     @decorator(slots=slots)
     class Attrs:
         value: int = attrs.field(converter=convert, validator=validate)
 
         def __attrs_post_init__(self):
             events.append("post_init")
+
+    codec.register(Attrs, name="Attrs", field_naming=None)
 
     original = Attrs("3")
     assert events == ["convert", "validate", "post_init"]
@@ -280,11 +291,12 @@ def test_attrs_decode_bypasses_converter_validator_but_runs_post_init(decorator,
 def test_registered_cycles_through_containers(mutual):
     codec = Codec()
 
-    @codec.register("Node")
     @dataclass
     class Node:
         label: str
         links: object = None
+
+    codec.register(Node, name="Node", field_naming=None)
 
     first = Node("first")
     second = Node("second") if mutual else first
@@ -308,10 +320,11 @@ def test_registered_cycles_through_containers(mutual):
 def test_unknown_nested_class_modes_preserve_cycles(mode):
     codec = Codec(unknown_class=mode)
 
-    @codec.register("Known")
     @dataclass
     class Known:
         child: object
+
+    codec.register(Known, name="Known", field_naming=None)
 
     unknown = HessianObject("Unknown", {"value": 7})
     unknown.fields["self"] = unknown
@@ -334,10 +347,11 @@ def test_unknown_nested_class_modes_preserve_cycles(mode):
 def test_many_registered_definitions_and_value_references_share_stream():
     codec = Codec()
 
-    @codec.register("N")
     @dataclass
     class N:
         x: int
+
+    codec.register(N, name="N", field_naming=None)
 
     a, b = N(1), N(2)
     wire = codec.dumps_many([a, b, {"a": a}, b])
@@ -355,18 +369,19 @@ def test_many_registered_definitions_and_value_references_share_stream():
 def test_mixed_max_depth_exact_and_one_too_deep(shape):
     codec = Codec(max_depth=3)
 
-    @codec.register("Box")
     @dataclass
     class Box:
         value: object
 
+    codec.register(Box, name="Box", field_naming=None)
+
     at_limit = Box([{"x": None}]) if shape == "object-list-map" else {"x": Box([None])}
     too_deep = Box([{"x": []}]) if shape == "object-list-map" else {"x": Box([[]])}
     assert codec.loads(codec.dumps(at_limit)) == at_limit
-    with pytest.raises(RecursionError, match="max_depth=3"):
+    with pytest.raises(EncodeError, match="max_depth=3"):
         codec.dumps(too_deep)
     writer = Codec()
-    writer.register("Box", Box)
+    writer.register(Box, name="Box", field_naming=None)
     with pytest.raises(DecodeError, match="max_depth=3"):
         codec.loads(writer.dumps(too_deep))
     assert codec.loads(codec.dumps(at_limit)) == at_limit
@@ -375,10 +390,11 @@ def test_mixed_max_depth_exact_and_one_too_deep(shape):
 def test_reference_at_depth_limit_does_not_expand_graph():
     codec = Codec(max_depth=1)
 
-    @codec.register("Node")
     @dataclass
     class Node:
         next: object = None
+
+    codec.register(Node, name="Node", field_naming=None)
 
     node = Node()
     node.next = node
@@ -392,10 +408,11 @@ def test_threaded_registration_and_nested_aliases():
     codec = Codec()
     barrier = Barrier(4)
 
-    @codec.register("Leaf")
     @dataclass(frozen=True, slots=True)
     class Leaf:
         value: int
+
+    codec.register(Leaf, name="Leaf", field_naming=None)
 
     def work(worker):
         @dataclass
@@ -403,7 +420,7 @@ def test_threaded_registration_and_nested_aliases():
             items: list
 
         barrier.wait(timeout=10)
-        codec.register(f"Batch{worker}", Batch)
+        codec.register(Batch, name=f"Batch{worker}", field_naming=None)
         for cycle in range(50):
             leaf = Leaf(cycle)
             original = Batch([leaf, {"again": leaf}])

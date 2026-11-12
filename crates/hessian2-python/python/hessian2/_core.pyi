@@ -21,48 +21,60 @@ class HessianObject:
     def __eq__(self, other: object, /) -> bool: ...
     __hash__: ClassVar[None]  # type: ignore[assignment]
 
+@final
+class _Hint:
+    def __new__(cls, plan: object, /) -> Self: ...
+
 class _Codec:
     def __new__(
         cls,
         *,
-        field_naming: Literal["camelCase"] | None = None,
         unknown_class: Literal["raise", "hessian_object", "dict"] = "raise",
         max_depth: int = 256,
     ) -> Self: ...
     @property
-    def field_naming(self) -> Literal["camelCase"] | None: ...
-    @property
     def unknown_class(self) -> Literal["raise", "hessian_object", "dict"]: ...
     @property
     def max_depth(self) -> int: ...
-    def dumps(self, /, obj: Any) -> bytes: ...
-    def dumps_many(self, /, values: Iterable[Any]) -> bytes: ...
-    def loads(self, /, data: ReadableBuffer) -> Any: ...
-    def loads_many(self, /, data: ReadableBuffer) -> list[Any]: ...
-    def _register_class(
+    def dumps(self, /, obj: Any, *, type: Any = None) -> bytes: ...
+    def dumps_many(
+        self, /, values: Iterable[Any], *, types: Iterable[Any] | None = None
+    ) -> bytes: ...
+    def loads(
         self,
+        /,
+        data: ReadableBuffer,
+        *,
+        unknown_class: Literal["raise", "hessian_object", "dict"] | None = None,
+    ) -> Any: ...
+    def loads_many(
+        self,
+        /,
+        data: ReadableBuffer,
+        *,
+        unknown_class: Literal["raise", "hessian_object", "dict"] | None = None,
+    ) -> list[Any]: ...
+    def _registered_name(self, ty: type, /) -> str | None: ...
+    @staticmethod
+    def _class_entry(
         name: str,
         cls: type,
-        fields: list[tuple[str, str, int, Any]],
+        fields: list[tuple[str, str, int, Any, Any]],
         post_init: tuple[str, tuple[Any, ...]] | None,
-        replace: bool,
         /,
-    ) -> None: ...
-    def _register_tuple(
-        self,
-        name: str,
-        cls: type,
-        fields: list[tuple[str, str, int, Any]],
-        replace: bool,
-        /,
-    ) -> None: ...
-    def _register_enum(self, name: str, cls: type, replace: bool, /) -> None: ...
-    def _register_converter(
-        self,
+    ) -> object: ...
+    @staticmethod
+    def _tuple_entry(
+        name: str, cls: type, fields: list[tuple[str, str, int, Any, Any]], /
+    ) -> object: ...
+    @staticmethod
+    def _enum_entry(name: str, cls: type, /) -> object: ...
+    @staticmethod
+    def _converter_entry(
         name: str,
         type: type,
         encode: Callable[[Any], dict[str, Any]],
         decode: Callable[[dict[str, Any]], Any],
-        replace: bool,
         /,
-    ) -> None: ...
+    ) -> object: ...
+    def _publish(self, entries: list[tuple[object, bool]], /) -> None: ...

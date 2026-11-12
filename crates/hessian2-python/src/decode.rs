@@ -8,7 +8,7 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use crate::builtins::{self, Builtin};
 use crate::codec::{Default, Entry, Field, Kind, Registry, Unknown};
 use crate::object::HessianObject;
-use crate::{DecodeError, time};
+use crate::{DecodeError, decode_user_error, time};
 
 /// How objects of one class definition are built, decided once per stream.
 enum Plan {
@@ -70,7 +70,10 @@ fn default<'py>(py: Python<'py>, entry: &Entry, field: &Field) -> PyResult<Bound
             entry.name, field.wire
         ))),
         Default::Value(value) => Ok(value.bind(py).clone()),
-        Default::Factory(factory) => factory.bind(py).call0(),
+        Default::Factory(factory) => factory
+            .bind(py)
+            .call0()
+            .map_err(|error| decode_user_error(py, error)),
     }
 }
 
@@ -454,7 +457,9 @@ impl<'a, 'py> Decoder<'a, 'py> {
             set(&field.attr, default(py, entry, field)?)?;
         }
         if let Some((name, args)) = post_init {
-            instance.call_method1(name.bind(py), args.bind(py))?;
+            instance
+                .call_method1(name.bind(py), args.bind(py))
+                .map_err(|error| decode_user_error(py, error))?;
         }
         Ok(instance)
     }
@@ -533,7 +538,10 @@ impl<'a, 'py> Decoder<'a, 'py> {
         for key in keys {
             fields.set_item(key.bind(py), self.value()?)?;
         }
-        let value = decode.bind(py).call1((fields,))?;
+        let value = decode
+            .bind(py)
+            .call1((fields,))
+            .map_err(|error| decode_user_error(py, error))?;
         self.refs[slot] = Some(value.clone());
         Ok(value)
     }

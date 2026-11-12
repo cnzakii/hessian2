@@ -33,9 +33,9 @@ def test_shared_codec_while_registering() -> None:
             if cycle % 25 == 0:
                 gc.collect()
             shared = dataclasses.make_dataclass(f"Shared{worker}_{cycle}", [])
-            codec.register("item.shared", shared, replace=True)
+            codec.register(shared, name="item.shared", field_naming=None, replace=True)
             item = dataclasses.make_dataclass(f"Item{worker}_{cycle}", [("cycle", int)])
-            codec.register(f"item.{worker}", item, replace=True)
+            codec.register(item, name=f"item.{worker}", field_naming=None, replace=True)
             assert codec.loads(codec.dumps(item(cycle))).cycle == cycle
             value = {"worker": worker, "cycle": cycle, "items": [str(cycle)] * 8}
             assert codec.loads(codec.dumps(value)) == value
@@ -49,11 +49,12 @@ def test_shared_codec_while_registering() -> None:
 def test_registered_class_round_trips_across_threads() -> None:
     codec = hessian2.Codec()
 
-    @codec.register("com.example.Point")
     @dataclasses.dataclass(frozen=True)
     class Point:
         x: int
         y: int
+
+    codec.register(Point, name="com.example.Point", field_naming=None)
 
     barrier = Barrier(WORKERS)
 

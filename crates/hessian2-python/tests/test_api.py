@@ -305,7 +305,7 @@ def test_default_max_depth() -> None:
     codec = Codec()
     assert codec.max_depth == 256
     assert roundtrip(nested_list(256)) == nested_list(256)
-    with pytest.raises(RecursionError):
+    with pytest.raises(EncodeError, match="max_depth=256"):
         codec.dumps(nested_list(257))
     with pytest.raises(DecodeError, match="max_depth=256"):
         codec.loads(b"\x79" * 257 + b"N")
@@ -322,7 +322,7 @@ def test_custom_max_depth() -> None:
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"max_depth": 0}, {"field_naming": "snake"}, {"unknown_class": "raw"}],
+    [{"max_depth": 0}, {"unknown_class": "raw"}],
     ids=repr,
 )
 def test_invalid_codec_options(kwargs: dict[str, Any]) -> None:
@@ -331,12 +331,8 @@ def test_invalid_codec_options(kwargs: dict[str, Any]) -> None:
 
 
 def test_codec_options_are_readable() -> None:
-    codec = Codec(field_naming="camelCase", unknown_class="dict", max_depth=9)
-    assert (codec.field_naming, codec.unknown_class, codec.max_depth) == (
-        "camelCase",
-        "dict",
-        9,
-    )
+    codec = Codec(unknown_class="dict", max_depth=9)
+    assert (codec.unknown_class, codec.max_depth) == ("dict", 9)
 
 
 # --- registration ------------------------------------------------------------
@@ -347,14 +343,15 @@ def make_codec(**kwargs: Any) -> Codec:
 
 
 def test_dataclass_round_trip_and_wire_names() -> None:
-    codec = make_codec(field_naming="camelCase")
+    codec = make_codec()
 
-    @codec.register("com.example.User")
     @dataclasses.dataclass(frozen=True)
     class User:
         user_name: str
         _private_id: int = 0
         tags: list[str] = dataclasses.field(default_factory=list)
+
+    codec.register(User, name="com.example.User")
 
     user = User("ann", 7, ["a"])
     data = codec.dumps(user)
@@ -366,12 +363,13 @@ def test_dataclass_round_trip_and_wire_names() -> None:
 def test_defaults_fill_missing_fields() -> None:
     codec = make_codec()
 
-    @codec.register("A")
     @dataclasses.dataclass
     class A:
         a: int
         b: int = 5
         c: list[int] = dataclasses.field(default_factory=lambda: [1])
+
+    codec.register(A, name="A", field_naming=None)
 
     wire = b"C\x01A\x91\x01a\x60\x91"
     first, second = codec.loads(wire), codec.loads(wire)
@@ -382,11 +380,12 @@ def test_defaults_fill_missing_fields() -> None:
 def test_missing_required_field() -> None:
     codec = make_codec()
 
-    @codec.register("A")
     @dataclasses.dataclass
     class A:
         a: int
         b: int
+
+    codec.register(A, name="A", field_naming=None)
 
     with pytest.raises(DecodeError, match='missing field "b"'):
         codec.loads(b"C\x01A\x91\x01a\x60\x91")
@@ -395,10 +394,11 @@ def test_missing_required_field() -> None:
 def test_unknown_wire_fields_are_ignored() -> None:
     codec = make_codec()
 
-    @codec.register("A")
     @dataclasses.dataclass
     class A:
         a: int
+
+    codec.register(A, name="A", field_naming=None)
 
     # Field "z" holds an object of an unregistered class.
     wire = b"C\x01A\x92\x01z\x01a\x60C\x01B\x90\x61\x91"
@@ -409,13 +409,14 @@ def test_post_init_runs_after_decoding() -> None:
     codec = make_codec()
     seen = []
 
-    @codec.register("A")
     @dataclasses.dataclass
     class A:
         a: int
 
         def __post_init__(self) -> None:
             seen.append(self.a)
+
+    codec.register(A, name="A", field_naming=None)
 
     codec.loads(codec.dumps(A(3)))
     assert seen == [3, 3]
@@ -424,13 +425,14 @@ def test_post_init_runs_after_decoding() -> None:
 def test_init_is_not_called() -> None:
     codec = make_codec()
 
-    @codec.register("A")
     @dataclasses.dataclass(init=False)
     class A:
         a: int
 
         def __init__(self) -> None:
             raise AssertionError("decoding must not call __init__")
+
+    codec.register(A, name="A", field_naming=None)
 
     obj = A.__new__(A)
     obj.a = 1
@@ -440,10 +442,11 @@ def test_init_is_not_called() -> None:
 def test_slots_dataclass() -> None:
     codec = make_codec()
 
-    @codec.register("S")
     @dataclasses.dataclass(slots=True, frozen=True)
     class S:
         x: int
+
+    codec.register(S, name="S", field_naming=None)
 
     assert roundtrip(S(1), codec) == S(1)
 
@@ -451,7 +454,6 @@ def test_slots_dataclass() -> None:
 def test_attrs_class() -> None:
     codec = make_codec()
 
-    @codec.register("P")
     @attrs.frozen
     class P:
         x: int
@@ -459,6 +461,8 @@ def test_attrs_class() -> None:
 
         def __attrs_post_init__(self) -> None:
             object.__setattr__(self, "x", self.x * 1)
+
+    codec.register(P, name="P", field_naming=None)
 
     assert roundtrip(P(1, [2]), codec) == P(1, [2])
     assert codec.loads(b"C\x01P\x91\x01x\x60\x91") == P(1, [])
@@ -470,16 +474,17 @@ def test_attrs_takes_self_factory_is_rejected() -> None:
         x: int = attrs.Factory(lambda self: 1, takes_self=True)
 
     with pytest.raises(TypeError, match="takes_self"):
-        make_codec().register("Q", Q)
+        make_codec().register(Q, name="Q", field_naming=None)
 
 
 def test_enum() -> None:
     codec = make_codec()
 
-    @codec.register("com.example.Color")
     class Color(enum.Enum):
         RED = 1
         GREEN = 2
+
+    codec.register(Color, name="com.example.Color", field_naming=None)
 
     data = codec.dumps([Color.RED, Color.GREEN, Color.RED])
     assert data.count(b"RED") == 1
@@ -499,7 +504,7 @@ def test_converter() -> None:
         Point, lambda p: {"x": p.x, "y": p.y}, lambda f: Point(f["x"], f["y"])
     )
     assert repr(converter) == f"Converter({Point.__qualname__})"
-    codec.register("Point", converter)
+    codec.register(converter, name="Point")
     point = codec.loads(codec.dumps(Point(1, 2)))
     assert (point.x, point.y) == (1, 2)
 
@@ -522,8 +527,8 @@ def test_converter_overrides_native_fast_paths(value: Any) -> None:
         return {"payload": hessian2.dumps(obj)}
 
     codec.register(
-        "Converted",
         Converter(type(value), to_fields, lambda f: hessian2.loads(f["payload"])),
+        name="Converted",
         replace=True,
     )
     first, second = codec.loads_many(codec.dumps_many([value, value]))
@@ -536,15 +541,15 @@ def test_converter_overrides_native_fast_paths(value: Any) -> None:
 def test_replacing_integer_converter_restores_native_encoding() -> None:
     codec = Codec()
     codec.register(
-        "java.math.BigInteger",
         Converter(int, lambda n: {"text": str(n)}, lambda f: int(f["text"])),
+        name="java.math.BigInteger",
         replace=True,
     )
     for value in (7, 2**100):
         assert codec.loads(codec.dumps(value)) == value
     codec.register(
-        "java.math.BigInteger",
         Converter(complex, lambda n: {"text": str(n)}, lambda f: complex(f["text"])),
+        name="java.math.BigInteger",
         replace=True,
     )
     assert codec.dumps(7) == hessian2.dumps(7)
@@ -559,18 +564,18 @@ def test_converter_cycle_fails_during_decoding() -> None:
     node = Node()
     node.next = node
     codec = Codec()
-    codec.register("Node", Converter(Node, vars, lambda f: Node(f["next"])))
+    codec.register(Converter(Node, vars, lambda f: Node(f["next"])), name="Node")
     with pytest.raises(DecodeError, match="still being decoded"):
         codec.loads(codec.dumps(node))
 
 
 def test_converter_must_return_str_keyed_dict() -> None:
     codec = make_codec()
-    codec.register("L", Converter(complex, lambda c: [1], lambda f: 0))
+    codec.register(Converter(complex, lambda c: [1], lambda f: 0), name="L")
     with pytest.raises(EncodeError, match="dict"):
         codec.dumps(1j)
     codec = make_codec()
-    codec.register("K", Converter(complex, lambda c: {1: 2}, lambda f: 0))
+    codec.register(Converter(complex, lambda c: {1: 2}, lambda f: 0), name="K")
     with pytest.raises(EncodeError, match="str"):
         codec.dumps(1j)
 
@@ -578,8 +583,8 @@ def test_converter_must_return_str_keyed_dict() -> None:
 def test_builtins_can_be_replaced() -> None:
     codec = make_codec()
     codec.register(
-        "java.util.UUID",
         Converter(uuid.UUID, lambda u: {"text": u.hex}, lambda f: uuid.UUID(f["text"])),
+        name="java.util.UUID",
     )
     value = uuid.uuid4()
     data = codec.dumps(value)
@@ -628,24 +633,26 @@ def test_registration_rules() -> None:
     class A:
         x: int
 
-    codec.register("first", A)
-    codec.register("first", A)  # the same mapping again is allowed
+    codec.register(A, name="first", field_naming=None)
+    codec.register(
+        A, name="first", field_naming=None
+    )  # the same mapping again is allowed
     with pytest.raises(ValueError, match="already registered as 'first'"):
-        codec.register("second", A)
+        codec.register(A, name="second", field_naming=None)
 
     @dataclasses.dataclass
     class B:
         y: int
 
     with pytest.raises(ValueError, match="'first' is already registered to .*A"):
-        codec.register("first", B)
-    codec.register("first", B, replace=True)
-    codec.register("second", A)  # A is free again
+        codec.register(B, name="first", field_naming=None)
+    codec.register(B, name="first", field_naming=None, replace=True)
+    codec.register(A, name="second", field_naming=None)  # A is free again
     assert codec.loads(codec.dumps(B(1))) == B(1)
     assert codec.loads(codec.dumps(A(1))) == A(1)
 
     # replace=True also moves a class to a new name; the old name still decodes.
-    codec.register("third", A, replace=True)
+    codec.register(A, name="third", field_naming=None, replace=True)
     assert b"third" in codec.dumps(A(1))
     assert codec.loads(hessian2.dumps(HessianObject("second", {"x": 2}))) == A(2)
 
@@ -658,8 +665,8 @@ def test_built_in_mappings_need_replace() -> None:
         value: str
 
     with pytest.raises(ValueError, match="built-in mapping"):
-        codec.register("java.math.BigDecimal", Money)
-    codec.register("java.math.BigDecimal", Money, replace=True)
+        codec.register(Money, name="java.math.BigDecimal", field_naming=None)
+    codec.register(Money, name="java.math.BigDecimal", field_naming=None, replace=True)
     assert codec.loads(codec.dumps(Money("1.5"))) == Money("1.5")
     # Decimal no longer has a mapping of its own.
     with pytest.raises(EncodeError):
@@ -669,15 +676,17 @@ def test_built_in_mappings_need_replace() -> None:
 def test_register_decorator_passes_replace() -> None:
     codec = make_codec()
 
-    @codec.register("P")
     @dataclasses.dataclass
     class P:
         x: int
 
-    @codec.register("P", replace=True)
+    codec.register(P, name="P", field_naming=None)
+
     @dataclasses.dataclass
     class Q:
         x: int
+
+    codec.register(Q, name="P", field_naming=None, replace=True)
 
     assert codec.loads(codec.dumps(Q(1))) == Q(1)
 
@@ -685,16 +694,17 @@ def test_register_decorator_passes_replace() -> None:
 @pytest.mark.parametrize("cls", [int, object(), dict], ids=repr)
 def test_register_rejects_unsupported(cls: Any) -> None:
     with pytest.raises(TypeError):
-        make_codec().register("X", cls)
+        make_codec().register(cls, name="X", field_naming=None)
 
 
 def test_registration_is_per_codec() -> None:
     codec = make_codec()
 
-    @codec.register("A")
     @dataclasses.dataclass
     class A:
         x: int
+
+    codec.register(A, name="A", field_naming=None)
 
     with pytest.raises(EncodeError):
         hessian2.dumps(A(1))
@@ -755,8 +765,8 @@ class Point(typing.NamedTuple):
 
 
 def test_named_tuple_round_trip() -> None:
-    codec = hessian2.Codec(field_naming="camelCase")
-    codec.register("com.example.Point", Point)
+    codec = hessian2.Codec()
+    codec.register(Point, name="com.example.Point")
     data = codec.dumps(Point(1, "a"))
     assert data.startswith(b"C\x11com.example.Point\x92\x04xPos\x05label")
     decoded = codec.loads(data)
@@ -766,7 +776,7 @@ def test_named_tuple_round_trip() -> None:
 
 def test_named_tuple_defaults_and_identity() -> None:
     codec = hessian2.Codec()
-    codec.register("com.example.Point", Point)
+    codec.register(Point, name="com.example.Point", field_naming=None)
     sparse = hessian2.dumps(HessianObject("com.example.Point", {"x_pos": 3}))
     assert codec.loads(sparse) == Point(3)
     with pytest.raises(hessian2.DecodeError, match="missing field"):
@@ -780,7 +790,7 @@ def test_collections_namedtuple() -> None:
     # The factory form, which some code still uses, on purpose.
     Pair = collections.namedtuple("Pair", ["left", "right"], defaults=[None])  # noqa: PYI024
     codec = hessian2.Codec()
-    codec.register("com.example.Pair", Pair)
+    codec.register(Pair, name="com.example.Pair", field_naming=None)
     assert codec.loads(codec.dumps(Pair(1))) == Pair(1, None)
     # An unregistered named tuple is a plain list, as for any tuple.
     assert hessian2.loads(hessian2.dumps(Pair(1, 2))) == [1, 2]
@@ -790,10 +800,11 @@ def test_dataclass_on_a_builtin_base_decodes_as_object_new_allows() -> None:
     # object.__new__ cannot lay out a dict subclass, and says so.
     codec = hessian2.Codec()
 
-    @codec.register("com.example.Bag")
     @dataclasses.dataclass(eq=False)
     class Bag(dict):
         size: int
+
+    codec.register(Bag, name="com.example.Bag", field_naming=None)
 
     with pytest.raises(TypeError, match=r"object\.__new__"):
         codec.loads(codec.dumps(Bag(1)))
@@ -804,10 +815,11 @@ def test_dataclass_on_an_extension_base_decodes_as_object_new_allows() -> None:
     # object.__new__ refuses to skip.
     codec = hessian2.Codec()
 
-    @codec.register("com.example.Packed")
     @dataclasses.dataclass(eq=False)
     class Packed(struct.Struct):
         size: int
+
+    codec.register(Packed, name="com.example.Packed", field_naming=None)
 
     wire = hessian2.dumps(HessianObject("com.example.Packed", {"size": 1}))
     with pytest.raises(TypeError, match=r"object\.__new__"):
@@ -819,13 +831,14 @@ def test_abstract_dataclass_cannot_be_decoded() -> None:
 
     codec = hessian2.Codec()
 
-    @codec.register("com.example.Shape")
     @dataclasses.dataclass
     class Shape(abc.ABC):
         sides: int
 
         @abc.abstractmethod
         def area(self) -> float: ...
+
+    codec.register(Shape, name="com.example.Shape", field_naming=None)
 
     wire = hessian2.dumps(HessianObject("com.example.Shape", {"sides": 3}))
     with pytest.raises(TypeError, match="abstract"):
@@ -836,10 +849,11 @@ def test_decoding_runs_data_descriptors() -> None:
     codec = hessian2.Codec()
     seen = []
 
-    @codec.register("com.example.Temp")
     @dataclasses.dataclass
     class Temp:
         celsius: float
+
+    codec.register(Temp, name="com.example.Temp", field_naming=None)
 
     def store(self: Any, value: float) -> None:
         seen.append(value)
@@ -861,8 +875,8 @@ def test_converter_runs_once_per_object_in_a_stream() -> None:
 
     codec = Codec()
     codec.register(
-        "Point",
         Converter(Point, lambda p: calls.append(p) or {"x": 1}, lambda f: Point()),
+        name="Point",
     )
     point = Point()
     first, second = codec.loads(codec.dumps([point, point]))
@@ -897,9 +911,9 @@ def test_replacing_an_old_decode_alias_preserves_the_current_encoder() -> None:
     class B:
         value: int
 
-    codec.register("Old", A)
-    codec.register("New", A, replace=True)
-    codec.register("Old", B, replace=True)
+    codec.register(A, name="Old", field_naming=None)
+    codec.register(A, name="New", field_naming=None, replace=True)
+    codec.register(B, name="Old", field_naming=None, replace=True)
     assert codec.loads(codec.dumps(A(1))) == A(1)
     assert codec.loads(codec.dumps(B(2))) == B(2)
     assert b"New" in codec.dumps(A(1))
@@ -912,7 +926,7 @@ def test_field_plan_handles_reordering_missing_and_extra_fields(width: int) -> N
     record = dataclasses.make_dataclass(
         "Record", [(f"f{i}", int, dataclasses.field(default=-1)) for i in range(width)]
     )
-    codec.register("Record", record)
+    codec.register(record, name="Record", field_naming=None)
     fields = {f"f{i}": i for i in reversed(range(1, width))}
     fields["ignored"] = [1, 2, 3]
     value = codec.loads(hessian2.dumps(HessianObject("Record", fields)))
@@ -927,8 +941,8 @@ def test_colliding_wire_field_names_fail_at_registration() -> None:
         userName: str
 
     with pytest.raises(ValueError, match="multiple Python fields map to 'userName'"):
-        Codec(field_naming="camelCase").register("Collision", Collision)
+        Codec().register(Collision, name="Collision")
     codec = Codec()
-    codec.register("Collision", Collision)
+    codec.register(Collision, name="Collision", field_naming=None)
     value = Collision("first", "second")
     assert codec.loads(codec.dumps(value)) == value

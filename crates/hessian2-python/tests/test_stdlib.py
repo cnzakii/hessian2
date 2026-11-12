@@ -212,9 +212,9 @@ def test_invalid_values_raise_decode_error(wire: bytes) -> None:
 def test_registering_a_builtin_name_replaces_it() -> None:
     codec = hessian2.Codec()
     codec.register(
-        JAVA8 + "LocalDateHandle",
         hessian2.Converter(
             datetime.date, lambda d: {"iso": d.isoformat()}, lambda f: f["iso"]
         ),
+        name=JAVA8 + "LocalDateHandle",
     )
     assert codec.loads(codec.dumps(datetime.date(2000, 1, 2))) == "2000-01-02"

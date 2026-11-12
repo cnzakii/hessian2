@@ -18,7 +18,7 @@ from hessian2 import Codec, Converter, DecodeError, EncodeError, HessianObject
 def test_static_extension_bases_remain_rejected(base):
     cls = dataclasses.make_dataclass("Extension", [("value", int)], bases=(base,))
     codec = Codec()
-    codec.register("Extension", cls)
+    codec.register(cls, name="Extension", field_naming=None)
     wire = hessian2.dumps(HessianObject("Extension", {"value": 1}))
     with pytest.raises(TypeError):
         object.__new__(cls)
@@ -52,7 +52,7 @@ def test_python_new_metaclass_and_init_subclass_are_bypassed(slots):
         value: int
 
     codec = Codec()
-    codec.register("Item", Item)
+    codec.register(Item, name="Item", field_naming=None)
     value = codec.loads(hessian2.dumps(HessianObject("Item", {"value": 3})))
     assert type(value) is Item and value.value == 3
     assert events == []
@@ -72,8 +72,8 @@ def test_abc_generic_and_class_reassignment():
         pass
 
     codec = Codec()
-    codec.register("Item", Item)
-    codec.register("Other", Other)
+    codec.register(Item, name="Item", field_naming=None)
+    codec.register(Other, name="Other", field_naming=None)
     item = Item(3)
     item.__class__ = Other
     decoded = codec.loads(codec.dumps(item))
@@ -98,7 +98,7 @@ def test_descriptor_can_change_instance_class_during_decode():
 
     Item.first = property(lambda self: self.__dict__["first"], store)
     codec = Codec()
-    codec.register("Item", Item)
+    codec.register(Item, name="Item", field_naming=None)
     decoded = codec.loads(
         hessian2.dumps(HessianObject("Item", {"first": 1, "second": 2}))
     )
@@ -144,7 +144,7 @@ def test_datetime_subclass_has_same_semantics_on_both_offset_paths():
     ids=["nested-time-handles", "bigint-mag", "date-in-list"],
 )
 def test_builtin_encoding_respects_depth(value):
-    with pytest.raises(RecursionError):
+    with pytest.raises(hessian2.EncodeError, match="max_depth=1"):
         Codec(max_depth=1).dumps(value)
 
 
@@ -155,7 +155,7 @@ def test_named_tuple_cycle_is_rejected_on_encode():
         children: list
 
     codec = Codec()
-    codec.register("Node", Node)
+    codec.register(Node, name="Node", field_naming=None)
     children = []
     value = Node(children)
     children.append(value)
@@ -175,7 +175,7 @@ def test_named_tuple_override_arity_defaults_and_references():
             raise AssertionError("must bypass __new__")
 
     codec = Codec()
-    codec.register("Pair", Custom)
+    codec.register(Custom, name="Pair", field_naming=None)
     wire = hessian2.dumps(HessianObject("Pair", {"left": [1], "ignored": 3}))
     decoded = codec.loads(wire)
     assert type(decoded) is Custom and decoded == ([1], 9)
@@ -205,7 +205,7 @@ def test_initvar_inheritance_kw_only_and_override():
             seen.append((seed, extra, self.value))
 
     codec = Codec()
-    codec.register("Item", Item)
+    codec.register(Item, name="Item", field_naming=None)
     wire = codec.dumps(Item())
     assert b"seed" not in wire and b"extra" not in wire
     assert codec.loads(wire) == Item()
@@ -276,15 +276,18 @@ def test_spare_refs_reentry_exception_cleanup_and_threads():
             raise ValueError("callback")
         return {"value": [shared, shared]}
 
-    codec.register("Value", Converter(Value, encode, lambda fields: fields["value"]))
+    codec.register(
+        Converter(Value, encode, lambda fields: fields["value"]), name="Value"
+    )
 
     def work(worker):
         barrier.wait()
         for _ in range(40):
             value = Value()
             value.fail = True
-            with pytest.raises(ValueError, match="callback"):
+            with pytest.raises(hessian2.EncodeError, match="callback") as error:
                 codec.dumps([[], value])
+            assert type(error.value.__cause__) is ValueError
             value.fail = False
             shared = []
             a, b, first, second = codec.loads(
@@ -331,7 +334,7 @@ def test_plain_class_registration_during_base_changes():
         codec = Codec()
         wire = hessian2.dumps(HessianObject("Item", {"value": 3}))
         for _ in range(1000):
-            codec.register("Item", Item)
+            codec.register(Item, name="Item", field_naming=None)
             assert codec.loads(wire).value == 3
 
     with ThreadPoolExecutor(2) as pool:

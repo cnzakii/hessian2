@@ -19,14 +19,12 @@ def main() -> None:
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
         assert not sys._is_gil_enabled()
 
-    codec = hessian2.Codec(field_naming="camelCase")
-
-    @codec.register("example.Address")
+    @hessian2.java_class("example.Address")
     @dataclasses.dataclass
     class Address:
         city: str
 
-    @codec.register("example.Order")
+    @hessian2.java_class("example.Order")
     @dataclasses.dataclass
     class Order:
         home_address: Address
@@ -34,6 +32,9 @@ def main() -> None:
         amount: Decimal
         order_id: UUID
         created_at: dt.datetime
+
+    codec = hessian2.Codec()
+    codec.register(Order)
 
     address = Address("Hangzhou")
     order = Order(

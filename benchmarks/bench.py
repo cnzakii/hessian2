@@ -21,10 +21,9 @@ import msgpack
 import orjson
 import pyperf
 
-codec = hessian2.Codec(field_naming="camelCase")
+codec = hessian2.Codec()
 
 
-@codec.register("com.example.User")
 @dataclasses.dataclass
 class User:
     user_id: int
@@ -35,6 +34,9 @@ class User:
     active: bool
     created: datetime.datetime
     tags: list[str]
+
+
+codec.register(User, name="com.example.User")
 
 
 def user(n: int) -> User:
