@@ -1,31 +1,28 @@
 # Changelog
 
-User-visible changes are recorded here before each release. No public release
-has been published from this repository yet.
+User-visible changes to hessian2 are recorded here.
 
 ## Unreleased
 
-### Python
+### Added
 
-- Hessian 2.0 encoding and decoding through `dumps`, `loads`, and multi-value
-  streams, with explicit per-Codec registration.
-- Dataclass, attrs, named tuple, Enum, Converter, and standard-library mappings.
-- Nested objects, shared references, configurable unknown-class handling,
-  and free-threaded CPython support.
-- GC-visible registration snapshots and unknown objects; replacing an old
-  decode alias no longer removes the current encoder mapping.
-- Converter field callbacks run once per object per stream. Explicit converters
-  also override native scalar/container encoding; cycles through a Converter
-  still being decoded raise `DecodeError`.
-- Type stubs accept the keyword arguments supported by the four stream methods.
-- Rename `on_unknown_class` to `unknown_class`. Ambiguous field names after
-  naming conversion fail at registration.
-
-### Rust
-
-- Pull Reader and Writer with per-stream class, type, and reference tables.
-- Faster string chunk scans and direct UTF-8/CESU-8 conversion; unpaired
-  surrogates remain supported by the Python binding.
-- Remove `text::utf16_len`; add `text::cesu8_to_utf8`,
-  `text::contains_surrogate`, and `text::push_cesu8_str`.
-- Both crates forbid unsafe code.
+- Python: Hessian 2.0 serialization through `dumps`, `loads`, `dumps_many`,
+  and `loads_many`, with support for CPython 3.11–3.15 and free-threaded
+  CPython 3.14/3.15.
+- Python: Per-Codec registration of dataclasses, attrs classes, named tuples,
+  and enums. Field names can be converted to camelCase; missing fields use
+  defaults, and unknown fields are consumed and ignored.
+- Python: `Converter` callbacks for other types, including Pydantic models.
+  Encoding calls `to_fields` once per object per stream. A Converter value
+  cannot be referenced back to while its fields are being decoded.
+- Python: Nested objects and shared references, including cycles through
+  lists, dictionaries, dataclass/attrs instances, and `HessianObject` values.
+  Registered named tuples reject cycles during encoding.
+- Python: Built-in mappings for large integers, Decimal, UUID, datetime,
+  date, time, and timedelta, with Java-compatible representations.
+- Python: `HessianObject` for values without registered Python classes,
+  configurable unknown-class handling, explicit registration replacement,
+  nesting limits, and typed public APIs.
+- Rust: The independent `hessian2-core` crate provides a pull `Reader`,
+  `Writer`, per-stream class/type/reference tables, and UTF-8/CESU-8
+  conversion. The Python binding also preserves unpaired surrogates.

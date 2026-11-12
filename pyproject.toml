@@ -20,6 +20,13 @@ test = [
     "pytest-cov>=7,<8",
     "tzdata>=2025.2",
 ]
+readme = [
+    "pydantic>=2,<3",
+]
+release = [
+    "packaging>=24",
+    "twine>=6,<7",
+]
 
 [tool.uv]
 package = false
