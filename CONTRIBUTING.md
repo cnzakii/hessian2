@@ -172,23 +172,19 @@ libc container, and the source archive is installed and tested separately.
 A final job checks the complete artifact set before anything is published.
 PR and manual runs never publish.
 
-One-time setup before the first tag:
-
-- Create a protected GitHub environment named `release`, restricted to
-  version tags.
-- Add a PyPI pending Trusted Publisher for owner `cnzakii`, repository
-  `hessian2`, workflow `release.yml`, environment `release`.
-- crates.io accepts Trusted Publishing only once a crate's first version
-  exists. Publish `hessian2-core` 0.1.0 by hand from the tagged commit with
-  `cargo publish -p hessian2-core --locked`, then configure Trusted Publishing
-  for the same repository, workflow, and environment. The workflow skips its
-  crates.io job for `v0.1.0`.
+Publishing uses Trusted Publishing, so no registry token is stored. PyPI
+(`hessian2`) and crates.io (`hessian2-core`) both trust owner `cnzakii`,
+repository `hessian2`, workflow `release.yml`, and environment `release`. The
+`release` environment accepts only `v*` tags and waits for maintainer
+approval. Renaming the workflow file or the environment breaks publishing
+until both registries are updated.
 
 For each release, merge the release PR, then push a tag such as `v0.1.0` and
 approve the `release` deployment. The tag must match the workspace version
 and point to a commit on `main`. The tag run builds and validates its own
 artifacts, publishes that Python artifact set without rebuilding it, and
-publishes the Rust crate from the same commit.
+publishes the Rust crate from the same commit. It then creates the GitHub
+Release, using the version's changelog entry as its notes.
 
 If publication partially succeeds, rerun only the failed jobs using the
 original artifacts. Never replace an uploaded file or rewrite a released tag;
