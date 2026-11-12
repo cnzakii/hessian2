@@ -7,10 +7,11 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyTimeAccess, PyTzInfo, PyTzInfoAccess,
+    PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyString, PyTimeAccess, PyTzInfo,
+    PyTzInfoAccess,
 };
 
-use crate::DecodeError;
+use crate::{DecodeError, EncodeError, builtins};
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
@@ -109,7 +110,7 @@ pub fn combine<'py>(
 
 /// Returns the microseconds from the epoch to a `datetime`'s fields read as
 /// UTC, ignoring its `tzinfo`.
-fn local_micros(value: &Bound<'_, PyDateTime>) -> i64 {
+pub fn local_micros(value: &Bound<'_, PyDateTime>) -> i64 {
     days_from_civil(
         i64::from(value.get_year()),
         i64::from(value.get_month()),
@@ -176,6 +177,43 @@ pub fn to_millis(value: &Bound<'_, PyDateTime>) -> PyResult<Option<i64>> {
         .map(|offset| (local - offset).div_euclid(1000)))
 }
 
+/// Returns the `java.time.ZoneId` ID for a `tzinfo` whose offset is
+/// `seconds`: a `zoneinfo.ZoneInfo`'s key, or for a `datetime.timezone` the
+/// ID `ZoneOffset.getId` gives that offset.
+///
+/// # Errors
+///
+/// Raises `EncodeError` for any other `tzinfo`, which names no Java zone.
+pub fn zone_id(tzinfo: &Bound<'_, PyTzInfo>, seconds: i32) -> PyResult<String> {
+    let py = tzinfo.py();
+    if tzinfo.is_instance(builtins::api(py)?.zone_info.bind(py))? {
+        if let Ok(key) = tzinfo.getattr(intern!(py, "key"))?.cast::<PyString>() {
+            return Ok(key.to_str()?.to_owned());
+        }
+    } else if tzinfo.is_instance(&PyTzInfo::utc(py)?.get_type())? {
+        return Ok(offset_id(seconds));
+    }
+    Err(EncodeError::new_err(
+        "java.time.ZonedDateTime needs a zoneinfo.ZoneInfo with a key, or a datetime.timezone",
+    ))
+}
+
+/// Returns the ID `ZoneOffset.getId` gives an offset: `Z`, `+hh:mm`, or
+/// `+hh:mm:ss`.
+fn offset_id(seconds: i32) -> String {
+    if seconds == 0 {
+        return "Z".to_owned();
+    }
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let total = seconds.unsigned_abs();
+    let (hours, minutes, rest) = (total / 3600, total / 60 % 60, total % 60);
+    if rest == 0 {
+        format!("{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}:{minutes:02}:{rest:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +229,13 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days);
         }
+    }
+
+    #[test]
+    fn offset_ids_match_zone_offset() {
+        assert_eq!(offset_id(0), "Z");
+        assert_eq!(offset_id(8 * 3600), "+08:00");
+        assert_eq!(offset_id(-(5 * 3600 + 30 * 60)), "-05:30");
+        assert_eq!(offset_id(3600 + 1), "+01:00:01");
     }
 }

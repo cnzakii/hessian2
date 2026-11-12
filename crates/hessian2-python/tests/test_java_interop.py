@@ -10,16 +10,20 @@ built the harness.
 from __future__ import annotations
 
 import base64
+import dataclasses
+import datetime as dt
 import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
+from zoneinfo import ZoneInfo
 
 import hessian2
 import pytest
 from describe import describe, unordered
+from hessian2 import HessianObject
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = json.loads(
@@ -50,6 +54,10 @@ CASES = [
     and not name.startswith("extra.review2_")
 ]
 IDS = [f"{name}-{writer}" for name, writer in CASES]
+# interop.Typed needs tags to be written back as Java reads it; see
+# test_typed_objects_round_trip_from_java.
+UNTAGGED_CASES = [case for case in CASES if not case[0].startswith("extra.typed_")]
+UNTAGGED_IDS = [f"{name}-{writer}" for name, writer in UNTAGGED_CASES]
 
 # Values Java itself writes lossily: the bytes carry something else.
 JAVA_LOSSY = {
@@ -183,8 +191,8 @@ def test_decodes_java_bytes(name: str, writer: str) -> None:
 
 @pytest.mark.parametrize(
     ("name", "writer"),
-    [(n, w) for n, w in CASES if n != "extra.shadowed_fields"],
-    ids=[f"{n}-{w}" for n, w in CASES if n != "extra.shadowed_fields"],
+    [(n, w) for n, w in UNTAGGED_CASES if n != "extra.shadowed_fields"],
+    ids=[f"{n}-{w}" for n, w in UNTAGGED_CASES if n != "extra.shadowed_fields"],
 )
 def test_reencodes_java_bytes(name: str, writer: str) -> None:
     raw = wire(name, writer)
@@ -244,7 +252,7 @@ def java_views(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, 
 
 
 @needs_java
-@pytest.mark.parametrize(("name", "reader"), CASES, ids=IDS)
+@pytest.mark.parametrize(("name", "reader"), UNTAGGED_CASES, ids=UNTAGGED_IDS)
 def test_java_reads_our_bytes(
     java_views: dict[str, dict[str, Any]], name: str, reader: str
 ) -> None:
@@ -337,3 +345,133 @@ def test_java_array_and_mutual_bean_cycles(writer):
     assert first.fields["name"] == "first" and second.fields["name"] == "second"
     assert first is repeated and first is not second
     assert first.fields["friend"] is second and second.fields["friend"] is first
+
+
+# --- Java types a plain int or datetime does not convert to --------------------
+
+
+class TypedExtra(TypedDict):
+    count: hessian2.Long
+
+
+@hessian2.java_class("interop.Typed", field_naming=None)
+@dataclasses.dataclass
+class Typed:
+    amount: hessian2.BigInteger
+    amounts: list[hessian2.BigInteger]
+    instant: hessian2.Instant | None
+    offset: hessian2.OffsetDateTime | None
+    zoned: hessian2.ZonedDateTime | None
+    ids: list[hessian2.Long]
+    extra: TypedExtra
+    any: hessian2.Long
+
+
+def java_types(tmp_path: Path, reader: str, cases: dict[str, tuple[bytes, str]]) -> Any:
+    """What a Java reader holds after reading each value as the given type."""
+    assert JAVA is not None
+    for name, (data, java_type) in cases.items():
+        (tmp_path / f"{name}.bin").write_bytes(data)
+        (tmp_path / f"{name}.type").write_text(java_type, encoding="utf-8")
+    result = subprocess.run(
+        [*JAVA, "types", reader, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+@needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+def test_java_reads_tagged_values_as_declared_types(
+    tmp_path: Path, reader: str
+) -> None:
+    moment = dt.datetime(2026, 1, 2, 3, 4, 5, 6000, tzinfo=ZoneInfo("Asia/Shanghai"))
+    # Caucho cannot read hessian-lite's java.time handles.
+    times = (moment, moment, moment) if reader == "lite" else (None, None, None)
+    typed = Typed(5, [6], *times, [7], {"count": 8}, 9)
+    # One list in two fields with different tags: each field gets its own.
+    shared = [6]
+    sharing = Typed(5, shared, *times, shared, {"count": 8}, 9)
+    exception = HessianObject("java.lang.RuntimeException", {"detailMessage": "boom"})
+    views = java_types(
+        tmp_path,
+        reader,
+        {
+            "untagged_big_integer": (hessian2.dumps(5), "java.math.BigInteger"),
+            "big_integer": (
+                hessian2.dumps(5, type=hessian2.BigInteger),
+                "java.math.BigInteger",
+            ),
+            "long_list": (
+                hessian2.dumps([1, 2], type=list[hessian2.Long]),
+                "java.util.List",
+            ),
+            "long_object": (hessian2.dumps(5, type=hessian2.Long), "java.lang.Object"),
+            "exception": (hessian2.dumps(exception), "java.lang.Throwable"),
+            "typed": (hessian2.dumps(typed), "interop.Typed"),
+            "sharing": (hessian2.dumps(sharing), "interop.Typed"),
+        },
+    )
+    assert "expected map/object" in views["untagged_big_integer"]["error"]
+    assert views["big_integer"] == {"class": "java.math.BigInteger"}
+    assert views["long_list"]["items"] == ["java.lang.Long", "java.lang.Long"]
+    assert views["long_object"] == {"class": "java.lang.Long"}
+    assert views["exception"] == {
+        "class": "java.lang.RuntimeException",
+        "message": "boom",
+    }
+    shared_fields = views["sharing"]["fields"]
+    assert shared_fields["amounts"]["items"] == ["java.math.BigInteger"]
+    assert shared_fields["ids"]["items"] == ["java.lang.Long"]
+    fields = views["typed"]["fields"]
+    assert fields["amount"] == {"class": "java.math.BigInteger"}
+    assert fields["amounts"]["items"] == ["java.math.BigInteger"]
+    assert fields["ids"]["items"] == ["java.lang.Long"]
+    assert fields["extra"]["values"] == ["java.lang.Long"]
+    assert fields["any"] == {"class": "java.lang.Long"}
+    if reader == "lite":
+        assert fields["instant"] == {"class": "java.time.Instant"}
+        assert fields["offset"] == {"class": "java.time.OffsetDateTime"}
+        assert fields["zoned"] == {"class": "java.time.ZonedDateTime"}
+
+
+@needs_java
+@pytest.mark.parametrize(
+    ("name", "writer"),
+    [
+        ("extra.typed_fields", "lite"),
+        ("extra.typed_without_time", "caucho"),
+        ("extra.typed_without_time", "lite"),
+    ],
+)
+@pytest.mark.parametrize("reader", ["caucho", "lite"])
+def test_typed_objects_round_trip_from_java(
+    tmp_path: Path, name: str, writer: str, reader: str
+) -> None:
+    codec = hessian2.Codec()
+    codec.register(Typed)
+    typed = codec.loads(wire(name, writer))
+    assert typed.amount == 5 and typed.amounts == [6] and typed.ids == [7]
+    assert typed.extra == {"count": 8} and typed.any == 9
+    times = (typed.instant, typed.offset, typed.zoned)
+    if name == "extra.typed_fields":
+        assert typed.instant == dt.datetime.fromtimestamp(1_700_000_000.123, dt.UTC)
+        assert typed.offset.utcoffset() == dt.timedelta(hours=8)
+        assert str(typed.zoned.tzinfo) == "Europe/Paris"
+        if reader == "caucho":
+            return  # Caucho cannot read hessian-lite's java.time handles.
+    else:
+        assert times == (None, None, None)
+    view = java_types(
+        tmp_path, reader, {"typed": (codec.dumps(typed), "interop.Typed")}
+    )
+    fields = view["typed"]["fields"]
+    assert fields["amount"] == {"class": "java.math.BigInteger"}
+    assert fields["amounts"]["items"] == ["java.math.BigInteger"]
+    assert fields["ids"]["items"] == ["java.lang.Long"]
+    assert fields["extra"]["values"] == ["java.lang.Long"]
+    assert fields["any"] == {"class": "java.lang.Long"}
+    if name == "extra.typed_fields":
+        assert fields["zoned"] == {"class": "java.time.ZonedDateTime"}

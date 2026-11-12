@@ -59,8 +59,8 @@ def test_registry_replacement_finalizer_can_reenter_codec():
                 return {'x': value.x}
             def __del__(self):
                 codec.loads(b'N')
-        codec.register('X', hessian2.Converter(A, Encode(), lambda f: A(**f)))
-        codec.register('X', B, replace=True)
+        codec.register(hessian2.Converter(A, Encode(), lambda f: A(**f)), name='X')
+        codec.register(B, name='X', replace=True)
         print('ok')
     """
     result = subprocess.run(
@@ -77,11 +77,11 @@ def test_invalid_enum_name_does_not_invoke_object_methods():
     codec = hessian2.Codec()
     events = []
 
-    @codec.register("E")
     class E(Enum):
         A = 1
 
-    @codec.register("Name")
+    codec.register(E, name="E", field_naming=None)
+
     @dataclass(eq=False)
     class Name:
         value: int
@@ -97,6 +97,8 @@ def test_invalid_enum_name_does_not_invoke_object_methods():
         def __str__(self):
             events.append("str")
             return "name"
+
+    codec.register(Name, name="Name", field_naming=None)
 
     wire = hessian2.dumps(
         hessian2.HessianObject(
@@ -121,7 +123,9 @@ def test_mutated_map_does_not_raise_a_rust_panic():
         values["added"] = 2
         return {"x": value.x}
 
-    codec.register("Value", hessian2.Converter(Value, encode, lambda f: Value(**f)))
+    codec.register(
+        hessian2.Converter(Value, encode, lambda f: Value(**f)), name="Value"
+    )
     try:
         wire = codec.dumps(values)
     except BaseException as error:
@@ -134,7 +138,6 @@ def test_registered_hooks_are_part_of_the_decode_trust_boundary():
     codec = hessian2.Codec()
     events = []
 
-    @codec.register("Key")
     @dataclass(eq=False)
     class Key:
         value: int
@@ -150,6 +153,8 @@ def test_registered_hooks_are_part_of_the_decode_trust_boundary():
             events.append("eq")
             return self.value == other.value
 
+    codec.register(Key, name="Key", field_naming=None)
+
     first = hessian2.HessianObject("Key", {"value": 1})
     second = hessian2.HessianObject("Key", {"value": 2})
     codec.loads(b"H" + hessian2.dumps_many([first, 0, second, 0]) + b"Z")
@@ -160,7 +165,6 @@ def test_encoding_existing_map_keys_does_not_rehash_them():
     codec = hessian2.Codec()
     events = []
 
-    @codec.register("Key")
     @dataclass(eq=False)
     class Key:
         value: int
@@ -172,6 +176,8 @@ def test_encoding_existing_map_keys_does_not_rehash_them():
         def __eq__(self, other):
             events.append("eq")
             return self.value == other.value
+
+    codec.register(Key, name="Key", field_naming=None)
 
     values = {Key(1): 1, Key(2): 2}
     events.clear()
@@ -199,7 +205,9 @@ def test_list_size_mutation_is_an_ordinary_error():
         values.append(None)
         return {"x": value.x}
 
-    codec.register("Value", hessian2.Converter(Value, encode, lambda f: Value(**f)))
+    codec.register(
+        hessian2.Converter(Value, encode, lambda f: Value(**f)), name="Value"
+    )
     with pytest.raises(hessian2.EncodeError, match="changed size"):
         codec.dumps(values)
 
@@ -222,7 +230,9 @@ def test_growing_list_stops_before_visiting_appended_elements():
             values.append(Value(calls))
         return {"x": value.x}
 
-    codec.register("Value", hessian2.Converter(Value, encode, lambda f: Value(**f)))
+    codec.register(
+        hessian2.Converter(Value, encode, lambda f: Value(**f)), name="Value"
+    )
     try:
         wire = codec.dumps(values)
     except (hessian2.EncodeError, RuntimeError):
@@ -244,13 +254,14 @@ def test_unknown_class_never_imports_its_name():
 def test_mutable_input_is_copied_before_callbacks():
     codec = hessian2.Codec()
 
-    @codec.register("Value")
     @dataclass
     class Value:
         x: int
 
         def __post_init__(self):
             data[:] = b"N" * len(data)
+
+    codec.register(Value, name="Value", field_naming=None)
 
     value = hessian2.HessianObject("Value", {"x": 1})
     data = bytearray(hessian2.dumps_many([value, value]))
@@ -267,13 +278,14 @@ def test_register_during_loads_uses_one_snapshot():
     class Replacement:
         x: int
 
-    @codec.register("Value")
     @dataclass
     class Original:
         x: int
 
         def __post_init__(self):
-            codec.register("Value", Replacement, replace=True)
+            codec.register(Replacement, name="Value", field_naming=None, replace=True)
+
+    codec.register(Original, name="Value", field_naming=None)
 
     wire = hessian2.dumps_many(
         [
@@ -289,10 +301,11 @@ def test_register_during_loads_uses_one_snapshot():
 def test_register_during_dumps_uses_one_snapshot():
     codec = hessian2.Codec()
 
-    @codec.register("Value")
     @dataclass
     class Original:
         x: int
+
+    codec.register(Original, name="Value", field_naming=None)
 
     @dataclass
     class Replacement:
@@ -303,10 +316,12 @@ def test_register_during_dumps_uses_one_snapshot():
         pass
 
     def encode(_):
-        codec.register("Value", Replacement, replace=True)
+        codec.register(Replacement, name="Value", field_naming=None, replace=True)
         return {}
 
-    codec.register("Trigger", hessian2.Converter(Trigger, encode, lambda _: Trigger()))
+    codec.register(
+        hessian2.Converter(Trigger, encode, lambda _: Trigger()), name="Trigger"
+    )
     wire = codec.dumps_many([Trigger(), Original(1)])
     decoded = hessian2.Codec(unknown_class="dict").loads_many(wire)
     assert decoded == [{}, {"x": 1}]
@@ -320,7 +335,9 @@ def test_concurrent_registration_preserves_independent_entries():
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(
             pool.map(
-                lambda pair: codec.register(f"Value{pair[0]}", pair[1], replace=True),
+                lambda pair: codec.register(
+                    pair[1], name=f"Value{pair[0]}", field_naming=None, replace=True
+                ),
                 enumerate(classes),
             )
         )
@@ -338,7 +355,6 @@ def test_concurrent_replacement_does_not_change_an_inflight_decode():
     class Replacement:
         x: int
 
-    @codec.register("Value")
     @dataclass
     class Original:
         x: int
@@ -346,6 +362,8 @@ def test_concurrent_replacement_does_not_change_an_inflight_decode():
         def __post_init__(self):
             entered.set()
             assert release.wait(5)
+
+    codec.register(Original, name="Value", field_naming=None)
 
     wire = hessian2.dumps_many(
         [
@@ -357,7 +375,7 @@ def test_concurrent_replacement_does_not_change_an_inflight_decode():
         result = pool.submit(codec.loads_many, wire)
         try:
             assert entered.wait(5)
-            codec.register("Value", Replacement, replace=True)
+            codec.register(Replacement, name="Value", field_naming=None, replace=True)
         finally:
             release.set()
         assert all(type(value) is Original for value in result.result(timeout=5))
@@ -382,7 +400,7 @@ def test_codec_registration_cycles_are_collected(kind):
                 return {"value": codec.max_depth}
 
             codec.register(
-                "Value", hessian2.Converter(Value, to_fields, lambda f: Value())
+                hessian2.Converter(Value, to_fields, lambda f: Value()), name="Value"
             )
         elif kind == "factory":
 
@@ -390,14 +408,14 @@ def test_codec_registration_cycles_are_collected(kind):
             class Value:
                 value: object = field(default_factory=lambda: codec)
 
-            codec.register("Value", Value)
+            codec.register(Value, name="Value", field_naming=None)
         elif kind == "default":
 
             @dataclass
             class Value:
                 value: object = codec
 
-            codec.register("Value", Value)
+            codec.register(Value, name="Value", field_naming=None)
         elif kind == "initvar":
 
             @dataclass
@@ -407,14 +425,15 @@ def test_codec_registration_cycles_are_collected(kind):
                 def __post_init__(self, value):
                     pass
 
-            codec.register("Value", Value)
+            codec.register(Value, name="Value", field_naming=None)
         else:
 
-            @codec.register("Value")
             @dataclass
             class Value:
                 def owner(self):
                     return codec
+
+            codec.register(Value, name="Value", field_naming=None)
 
         return weakref.ref(codec), weakref.ref(Value)
 
@@ -439,7 +458,7 @@ def test_gc_keeps_the_old_registration_alive_during_a_call():
 
     class ToFields:
         def __call__(self, value):
-            codec.register("Value", Replacement, replace=True)
+            codec.register(Replacement, name="Value", field_naming=None, replace=True)
             gc.collect()
             assert callback_ref() is self
             seen.append(value)
@@ -448,7 +467,7 @@ def test_gc_keeps_the_old_registration_alive_during_a_call():
     callback = ToFields()
     callback_ref = weakref.ref(callback)
     codec.register(
-        "Value", hessian2.Converter(Original, callback, lambda f: Original())
+        hessian2.Converter(Original, callback, lambda f: Original()), name="Value"
     )
     del callback
     value = Original()
@@ -472,9 +491,9 @@ def test_codecs_sharing_registrations_are_collected_without_double_counting():
             left: object = first
             right: object = second
 
-        first.register("Value", Value)
-        second.register("Value", Value)
-        first.register("Alias", Value, replace=True)
+        first.register(Value, name="Value", field_naming=None)
+        second.register(Value, name="Value", field_naming=None)
+        first.register(Value, name="Alias", field_naming=None, replace=True)
         return weakref.ref(first), weakref.ref(second), weakref.ref(Value)
 
     refs = build()

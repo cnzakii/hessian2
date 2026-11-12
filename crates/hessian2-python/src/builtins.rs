@@ -429,7 +429,7 @@ pub struct Api {
     decimal: Py<PyType>,
     uuid: Py<PyType>,
     uuid_unknown: Py<PyAny>,
-    zone_info: Py<PyAny>,
+    pub zone_info: Py<PyAny>,
 }
 
 /// Returns the shared [`Api`], importing its modules on first use.

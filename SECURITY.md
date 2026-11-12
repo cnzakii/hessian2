@@ -25,8 +25,11 @@ No response-time or supported service-level commitment is implied.
 ## Security boundary
 
 - Unknown class names never cause imports. Only built-in mappings and
-  explicitly registered classes/callbacks can be constructed.
-- Registration is a trust decision. Descriptors, default factories,
+  classes/callbacks registered with the decoding Codec can be constructed.
+  `@java_class` alone allows encoding, not decoding.
+- Registration is a trust decision. `Codec.register` also registers the
+  declared classes that the registered type's field annotations refer to,
+  so registering a class trusts those too. Descriptors, default factories,
   post-init hooks, Converter callbacks, and custom map-key hashing/equality
   can run application code during decoding. Type annotations do not validate
   incoming field values.

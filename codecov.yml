@@ -6,7 +6,9 @@ coverage:
         threshold: 1%
     patch:
       default:
-        target: auto
+        # A fixed bar: "auto" demands the project's own near-100% rate of
+        # every change, which an unreachable defensive line fails.
+        target: 95%
 
 flags:
   python:

@@ -17,6 +17,7 @@ use crate::address::AddressMap;
 use crate::builtins::Builtin;
 use crate::decode::Decoder;
 use crate::encode::Encoder;
+use crate::hint::{self, Hint};
 
 /// What decoding does with an object whose class has no registration.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,19 @@ pub enum Unknown {
     Raise,
     Object,
     Dict,
+}
+
+impl Unknown {
+    fn parse(value: &str) -> PyResult<Self> {
+        match value {
+            "raise" => Ok(Self::Raise),
+            "hessian_object" => Ok(Self::Object),
+            "dict" => Ok(Self::Dict),
+            other => Err(PyValueError::new_err(format!(
+                "unknown_class must be 'raise', 'hessian_object', or 'dict', not {other:?}"
+            ))),
+        }
+    }
 }
 
 pub enum Default {
@@ -36,6 +50,8 @@ pub struct Field {
     pub attr: Py<PyString>,
     pub wire: String,
     pub default: Default,
+    /// How the field's values are written, from its annotation.
+    pub hint: Option<Hint>,
 }
 
 pub enum Kind {
@@ -172,7 +188,6 @@ impl Registry {
 /// The Rust base of `hessian2.Codec`, which adds registration.
 #[pyclass(name = "_Codec", module = "hessian2._core", subclass, frozen)]
 pub struct Codec {
-    camel: bool,
     unknown: Unknown,
     max_depth: usize,
     registry: RwLock<Option<Py<Registry>>>,
@@ -188,48 +203,56 @@ impl Codec {
             .ok_or_else(|| PyRuntimeError::new_err("codec has been cleared by garbage collection"))
     }
 
-    /// Replaces a registration atomically against the snapshot it was built from.
-    fn insert(&self, py: Python<'_>, entry: Entry, replace: bool) -> PyResult<()> {
-        let type_key = entry.ty.as_ptr() as usize;
-        let entry = Py::new(py, entry)?;
+    /// Registers every entry, each replacing what it conflicts with only
+    /// when its flag says so, or none of them: the registry is swapped
+    /// atomically against the snapshot the batch was checked on.
+    ///
+    /// Entries come from the `_*_entry` builders. An entry no codec
+    /// registers is how a class declared with `hessian2.java_class` encodes:
+    /// the Python package caches it on the declaration, and its name does
+    /// not decode.
+    fn publish(&self, py: Python<'_>, entries: &[(Py<Entry>, bool)]) -> PyResult<()> {
         loop {
             let previous = self.snapshot(py)?;
-            let registry = previous.get();
-            let new = entry.get();
-            if !replace {
-                if let Some(existing) = registry.by_name.get(&new.name)
-                    && !existing.get().ty.is(&new.ty)
-                {
-                    return Err(PyValueError::new_err(format!(
-                        "{} is already registered to {}; pass replace=True to replace it",
-                        PyString::new(py, &new.name).repr()?,
-                        existing.get().describe(py)?,
-                    )));
+            let mut next = previous.get().clone_ref(py);
+            for (entry, replace) in entries {
+                let new = entry.get();
+                let type_key = new.ty.as_ptr() as usize;
+                // Checked against `next`, so entries in one batch cannot conflict either.
+                if !replace {
+                    if let Some(existing) = next.by_name.get(&new.name)
+                        && !existing.get().ty.is(&new.ty)
+                    {
+                        return Err(PyValueError::new_err(format!(
+                            "{} is already registered to {}; pass replace=True to replace it",
+                            PyString::new(py, &new.name).repr()?,
+                            existing.get().describe(py)?,
+                        )));
+                    }
+                    if let Some(existing) = next.by_type.get(&type_key)
+                        && existing.get().name != new.name
+                    {
+                        return Err(PyValueError::new_err(format!(
+                            "{} is already registered as {}; pass replace=True to move it",
+                            new.ty.bind(py).qualname()?,
+                            PyString::new(py, &existing.get().name).repr()?,
+                        )));
+                    }
                 }
-                if let Some(existing) = registry.by_type.get(&type_key)
-                    && existing.get().name != new.name
-                {
-                    return Err(PyValueError::new_err(format!(
-                        "{} is already registered as {}; pass replace=True to move it",
-                        new.ty.bind(py).qualname()?,
-                        PyString::new(py, &existing.get().name).repr()?,
-                    )));
+                if let Some(replaced) = next.by_name.remove(&new.name) {
+                    let old_type = replaced.get().ty.as_ptr() as usize;
+                    // An old decode alias must not remove the type's newer encoding.
+                    if next
+                        .by_type
+                        .get(&old_type)
+                        .is_some_and(|current| current.is(&replaced))
+                    {
+                        next.by_type.remove(&old_type);
+                    }
                 }
+                next.by_type.insert(type_key, entry.clone_ref(py));
+                next.by_name.insert(new.name.clone(), entry.clone_ref(py));
             }
-            let mut next = registry.clone_ref(py);
-            if let Some(replaced) = next.by_name.remove(&new.name) {
-                let old_type = replaced.get().ty.as_ptr() as usize;
-                // An old decode alias must not remove the type's newer encoding.
-                if next
-                    .by_type
-                    .get(&old_type)
-                    .is_some_and(|current| current.is(&replaced))
-                {
-                    next.by_type.remove(&old_type);
-                }
-            }
-            next.by_type.insert(type_key, entry.clone_ref(py));
-            next.by_name.insert(new.name.clone(), entry.clone_ref(py));
             next.natives_overridden = [
                 py.get_type::<PyNone>(),
                 py.get_type::<PyString>(),
@@ -283,32 +306,9 @@ impl Codec {
     }
 
     #[new]
-    #[pyo3(signature = (*, field_naming = None, unknown_class = "raise", max_depth = 256))]
-    fn new(
-        py: Python<'_>,
-        field_naming: Option<&str>,
-        unknown_class: &str,
-        max_depth: usize,
-    ) -> PyResult<Self> {
-        let camel = match field_naming {
-            None => false,
-            Some("camelCase") => true,
-            Some(other) => {
-                return Err(PyValueError::new_err(format!(
-                    "field_naming must be None or 'camelCase', not {other:?}"
-                )));
-            }
-        };
-        let unknown = match unknown_class {
-            "raise" => Unknown::Raise,
-            "hessian_object" => Unknown::Object,
-            "dict" => Unknown::Dict,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown_class must be 'raise', 'hessian_object', or 'dict', not {other:?}"
-                )));
-            }
-        };
+    #[pyo3(signature = (*, unknown_class = "raise", max_depth = 256))]
+    fn new(py: Python<'_>, unknown_class: &str, max_depth: usize) -> PyResult<Self> {
+        let unknown = Unknown::parse(unknown_class)?;
         if max_depth == 0 {
             return Err(PyValueError::new_err("max_depth must be at least 1"));
         }
@@ -337,18 +337,11 @@ impl Codec {
             }
         }
         let codec = Self {
-            camel,
             unknown,
             max_depth,
             registry: RwLock::new(Some(Py::new(py, registry)?)),
         };
         Ok(codec)
-    }
-
-    /// How field names are sent: ``None`` or ``"camelCase"``.
-    #[getter]
-    fn field_naming(&self) -> Option<&'static str> {
-        self.camel.then_some("camelCase")
     }
 
     /// How deeply values may nest.
@@ -371,17 +364,32 @@ impl Codec {
     ///
     /// Args:
     ///     obj: The value to encode.
+    ///     type: An annotation for ``obj``, such as ``list[hessian2.Long]``,
+    ///         whose tags choose the Java types its values are written as.
     ///
     /// Returns:
     ///     The stream.
     ///
     /// Raises:
-    ///     EncodeError: If a value has no Hessian form under this codec.
-    ///     RecursionError: If values nest deeper than ``max_depth``.
-    fn dumps(&self, py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
-        let registry = self.snapshot(py)?;
-        let mut encoder = Encoder::new(py, registry.get(), self.max_depth);
-        encoder.value(obj)?;
+    ///     EncodeError: If a value has no Hessian form under this codec or
+    ///         values nest deeper than ``max_depth``; also wrapping, as its
+    ///         ``__cause__``, a ``ValueError`` or ``TypeError`` raised by a
+    ///         converter or a field's getter.
+    #[pyo3(signature = (obj, *, r#type = None))]
+    fn dumps(
+        slf: &Bound<'_, Self>,
+        obj: &Bound<'_, PyAny>,
+        r#type: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyBytes>> {
+        let py = slf.py();
+        let this = slf.get();
+        let hint = match r#type {
+            Some(annotation) => hint::lookup(slf.as_any(), annotation)?,
+            None => None,
+        };
+        let registry = this.snapshot(py)?;
+        let mut encoder = Encoder::new(py, registry.get(), this.max_depth, slf.as_any());
+        encoder.hinted(obj, hint.as_ref().and_then(|h| h.get().0.as_ref()))?;
         Ok(PyBytes::new(py, encoder.finish()).unbind())
     }
 
@@ -392,18 +400,50 @@ impl Codec {
     ///
     /// Args:
     ///     values: An iterable of the values to encode.
+    ///     types: An annotation for each value, or ``None`` for a value
+    ///         without one, as for ``dumps``.
     ///
     /// Returns:
     ///     The stream.
     ///
     /// Raises:
-    ///     EncodeError: If a value has no Hessian form under this codec.
-    ///     RecursionError: If values nest deeper than ``max_depth``.
-    fn dumps_many(&self, py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
-        let registry = self.snapshot(py)?;
-        let mut encoder = Encoder::new(py, registry.get(), self.max_depth);
+    ///     EncodeError: As for ``dumps``.
+    ///     ValueError: If ``types`` and ``values`` differ in length.
+    #[pyo3(signature = (values, *, types = None))]
+    fn dumps_many(
+        slf: &Bound<'_, Self>,
+        values: &Bound<'_, PyAny>,
+        types: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyBytes>> {
+        let py = slf.py();
+        let this = slf.get();
+        let hints = match types {
+            Some(types) => Some(
+                types
+                    .try_iter()?
+                    .map(|annotation| hint::lookup(slf.as_any(), &annotation?))
+                    .collect::<PyResult<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        let registry = this.snapshot(py)?;
+        let mut encoder = Encoder::new(py, registry.get(), this.max_depth, slf.as_any());
+        let mut count = 0;
         for value in values.try_iter()? {
-            encoder.value(&value?)?;
+            let hint = match &hints {
+                Some(hints) => match hints.get(count) {
+                    Some(hint) => hint.as_ref(),
+                    None => return Err(length_mismatch(hints.len())),
+                },
+                None => None,
+            };
+            encoder.hinted(&value?, hint.and_then(|h| h.get().0.as_ref()))?;
+            count += 1;
+        }
+        if let Some(hints) = hints
+            && hints.len() != count
+        {
+            return Err(length_mismatch(hints.len()));
         }
         Ok(PyBytes::new(py, encoder.finish()).unbind())
     }
@@ -412,17 +452,28 @@ impl Codec {
     ///
     /// Args:
     ///     data: The stream, as ``bytes`` or another buffer.
+    ///     unknown_class: Overrides the codec's ``unknown_class`` for this
+    ///         call.
     ///
     /// Returns:
     ///     The value.
     ///
     /// Raises:
-    ///     DecodeError: If ``data`` is not one valid value under this codec,
-    ///         or holds more than one.
-    fn loads(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    ///     DecodeError: If ``data`` is not one valid value under this codec
+    ///         or holds more than one; also wrapping, as its ``__cause__``, a
+    ///         ``ValueError`` or ``TypeError`` raised by a converter,
+    ///         post-init method, or default factory.
+    #[pyo3(signature = (data, *, unknown_class = None))]
+    fn loads(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        unknown_class: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let unknown = self.unknown_for(unknown_class)?;
         let registry = self.snapshot(py)?;
         with_buffer(data, |bytes| {
-            let mut decoder = Decoder::new(py, bytes, registry.get(), self.unknown, self.max_depth);
+            let mut decoder = Decoder::new(py, bytes, registry.get(), unknown, self.max_depth);
             let value = decoder.value()?;
             decoder.finish()?;
             Ok(value.unbind())
@@ -433,17 +484,25 @@ impl Codec {
     ///
     /// Args:
     ///     data: The stream, as ``bytes`` or another buffer.
+    ///     unknown_class: Overrides the codec's ``unknown_class`` for this
+    ///         call.
     ///
     /// Returns:
     ///     The values, in order.
     ///
     /// Raises:
-    ///     DecodeError: If ``data`` is not a sequence of valid values under
-    ///         this codec.
-    fn loads_many(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyList>> {
+    ///     DecodeError: As for ``loads``.
+    #[pyo3(signature = (data, *, unknown_class = None))]
+    fn loads_many(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        unknown_class: Option<&str>,
+    ) -> PyResult<Py<PyList>> {
+        let unknown = self.unknown_for(unknown_class)?;
         let registry = self.snapshot(py)?;
         with_buffer(data, |bytes| {
-            let mut decoder = Decoder::new(py, bytes, registry.get(), self.unknown, self.max_depth);
+            let mut decoder = Decoder::new(py, bytes, registry.get(), unknown, self.max_depth);
             let values = PyList::empty(py);
             while !decoder.is_empty() {
                 values.append(decoder.value()?)?;
@@ -452,21 +511,41 @@ impl Codec {
         })
     }
 
-    fn _register_class(
-        &self,
+    /// Returns the name a type is registered under for decoding, or `None`
+    /// for a built-in mapping, a type whose name another registration has
+    /// since taken, or no entry.
+    fn _registered_name(&self, py: Python<'_>, ty: &Bound<'_, PyType>) -> PyResult<Option<String>> {
+        let registry = self.snapshot(py)?;
+        let registry = registry.get();
+        Ok(registry
+            .by_type
+            .get(&(ty.as_ptr() as usize))
+            .filter(|entry| {
+                !matches!(entry.get().kind, Kind::Value(_))
+                    && registry
+                        .by_name
+                        .get(&entry.get().name)
+                        .is_some_and(|named| named.is(*entry))
+            })
+            .map(|entry| entry.get().name.clone()))
+    }
+
+    /// Returns the entry for a dataclass or attrs class.
+    #[staticmethod]
+    fn _class_entry(
         py: Python<'_>,
         name: String,
         cls: Bound<'_, PyType>,
         fields: Vec<FieldSpec<'_>>,
         post_init: Option<(Bound<'_, PyString>, Bound<'_, PyTuple>)>,
-        replace: bool,
-    ) -> PyResult<()> {
+    ) -> PyResult<Py<Entry>> {
         let fields = to_fields(py, fields)?;
         let setattr = intern!(py, "__setattr__");
         let bypass_setattr = !cls
             .getattr(setattr)?
             .is(py.get_type::<pyo3::PyAny>().getattr(setattr)?);
-        self.insert(
+        let post_init = post_init.map(|(name, args)| (name.unbind(), args.unbind()));
+        Py::new(
             py,
             Entry {
                 name,
@@ -474,80 +553,99 @@ impl Codec {
                 kind: Kind::Class {
                     fields,
                     bypass_setattr,
-                    post_init: post_init.map(|(name, args)| (name.unbind(), args.unbind())),
+                    post_init,
                 },
             },
-            replace,
         )
     }
 
-    fn _register_tuple(
-        &self,
+    /// Returns the entry for a named tuple.
+    #[staticmethod]
+    fn _tuple_entry(
         py: Python<'_>,
         name: String,
         cls: Bound<'_, PyType>,
         fields: Vec<FieldSpec<'_>>,
-        replace: bool,
-    ) -> PyResult<()> {
+    ) -> PyResult<Py<Entry>> {
         let fields = to_fields(py, fields)?;
-        self.insert(
+        let kind = Kind::Tuple { fields };
+        Py::new(
             py,
             Entry {
                 name,
                 ty: cls.unbind(),
-                kind: Kind::Tuple { fields },
+                kind,
             },
-            replace,
         )
     }
 
-    fn _register_enum(
-        &self,
-        py: Python<'_>,
-        name: String,
-        cls: Bound<'_, PyType>,
-        replace: bool,
-    ) -> PyResult<()> {
-        self.insert(
+    /// Returns the entry for an Enum, sent by member name.
+    #[staticmethod]
+    fn _enum_entry(py: Python<'_>, name: String, cls: Bound<'_, PyType>) -> PyResult<Py<Entry>> {
+        let kind = Kind::Enum;
+        Py::new(
             py,
             Entry {
                 name,
                 ty: cls.unbind(),
-                kind: Kind::Enum,
+                kind,
             },
-            replace,
         )
     }
 
-    fn _register_converter(
-        &self,
+    /// Returns the entry for a `hessian2.Converter`.
+    #[staticmethod]
+    fn _converter_entry(
         py: Python<'_>,
         name: String,
         ty: Bound<'_, PyType>,
         encode: Py<PyAny>,
         decode: Py<PyAny>,
-        replace: bool,
-    ) -> PyResult<()> {
-        self.insert(
+    ) -> PyResult<Py<Entry>> {
+        let kind = Kind::Converter { encode, decode };
+        Py::new(
             py,
             Entry {
                 name,
                 ty: ty.unbind(),
-                kind: Kind::Converter { encode, decode },
+                kind,
             },
-            replace,
         )
+    }
+
+    /// Registers entries with their `replace` flags, all or none.
+    fn _publish(&self, py: Python<'_>, entries: Vec<(Py<Entry>, bool)>) -> PyResult<()> {
+        self.publish(py, &entries)
     }
 }
 
+impl Codec {
+    fn unknown_for(&self, unknown_class: Option<&str>) -> PyResult<Unknown> {
+        unknown_class.map_or(Ok(self.unknown), Unknown::parse)
+    }
+}
+
+fn length_mismatch(types: usize) -> PyErr {
+    PyValueError::new_err(format!(
+        "types has {types} annotations, but values has a different number of items"
+    ))
+}
+
 /// A field as the Python package describes it: attribute name, wire name,
-/// default kind (0 required, 1 value, 2 factory), and default.
-type FieldSpec<'py> = (Bound<'py, PyString>, String, u8, Py<PyAny>);
+/// default kind (0 required, 1 value, 2 factory), default, and encoding hint
+/// plan.
+type FieldSpec<'py> = (
+    Bound<'py, PyString>,
+    String,
+    u8,
+    Py<PyAny>,
+    Bound<'py, PyAny>,
+);
 
 fn to_fields(py: Python<'_>, specs: Vec<FieldSpec<'_>>) -> PyResult<Vec<Field>> {
     let mut names = HashSet::with_capacity(specs.len());
     let mut fields = Vec::with_capacity(specs.len());
-    for (attr, wire, kind, default) in specs {
+    for (attr, wire, kind, default, plan) in specs {
         if !names.insert(wire.clone()) {
             return Err(PyValueError::new_err(format!(
                 "multiple Python fields map to {}; choose distinct field names",
@@ -563,6 +661,7 @@ fn to_fields(py: Python<'_>, specs: Vec<FieldSpec<'_>>) -> PyResult<Vec<Field>> 
                 1 => Default::Value(default),
                 _ => Default::Factory(default),
             },
+            hint: Hint::parse(&plan)?,
         });
     }
     Ok(fields)

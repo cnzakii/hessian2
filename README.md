@@ -55,10 +55,10 @@ print(received["tags"])  # ['customer']
 
 ### Nested objects, references, and built-in types
 
-Register the Java class names your peer uses. Here an order contains a
+Declare the Java class names your peer uses. Here an order contains a
 customer and an address, and both address fields point to **the same
 Address instance**. Decimal, UUID, and an aware datetime use the built-in
-Java mappings without registration.
+Java mappings without declarations.
 
 ```python
 from dataclasses import dataclass
@@ -68,24 +68,22 @@ from uuid import UUID
 
 import hessian2
 
-codec = hessian2.Codec(field_naming="camelCase")
 
-
-@codec.register("com.example.Address")
+@hessian2.java_class("com.example.Address")
 @dataclass
 class Address:
     city: str
     postal_code: str
 
 
-@codec.register("com.example.Customer")
+@hessian2.java_class("com.example.Customer")
 @dataclass
 class Customer:
     user_name: str
     address: Address
 
 
-@codec.register("com.example.Order")
+@hessian2.java_class("com.example.Order")
 @dataclass
 class Order:
     order_id: UUID
@@ -108,7 +106,12 @@ order = Order(
 
 # Python names become Java fields: orderId, deliveryAddress, postalCode, ...
 # The address is sent once; the second occurrence is a Hessian reference.
-payload = codec.dumps(order)
+payload = hessian2.dumps(order)
+
+# Decoding builds only registered classes. Registering Order also registers
+# Customer and Address, which its fields refer to.
+codec = hessian2.Codec()
+codec.register(Order)
 received = codec.loads(payload)
 
 print(received.customer.user_name)  # alice
@@ -120,12 +123,11 @@ print(received.order_id, type(received.order_id).__name__)
 print(received.created_at.isoformat())  # 2026-01-01T12:00:00+00:00
 ```
 
-Registration applies throughout the object graph: nested values can be
-registered objects, lists, maps, and standard-library values. Shared
-references are preserved. Lists, dictionaries, dataclass/attrs instances,
-and `HessianObject` values also support cycles. Registered named tuples
-reject cycles during encoding; Converter values cannot be referenced back
-to while their fields are being decoded.
+Nested values can be declared objects, lists, maps, and standard-library
+values. Shared references are preserved. Lists, dictionaries,
+dataclass/attrs instances, and `HessianObject` values also support cycles.
+Named tuples reject cycles during encoding; Converter values cannot be
+referenced back to while their fields are being decoded.
 
 ### Multiple values in one stream
 
@@ -245,19 +247,34 @@ your application needs when interpreting the results.
 
 </details>
 
-## Registered classes
+## Classes
 
-| Register | Object representation |
+| Declare or register | Object representation |
 |---|---|
 | dataclass, attrs class | One field per declared attribute |
 | `typing.NamedTuple`, `collections.namedtuple` | One field per named item |
 | `enum.Enum` | A `name` field, as Java writes an enum |
 | `Converter` for any other type | The field dictionary returned by `to_fields` |
 
+`@hessian2.java_class(name)` records the Java class name on a class. Every
+codec, including the module-level functions, encodes declared classes. A
+subclass is not declared by inheriting from a declared class.
+
+Decoding builds only the classes registered with a codec, because that is
+what lets peer input construct them and run their post-init code.
+`codec.register(Order)` registers `Order` and every declared class its field
+annotations refer to, through lists, dicts, unions, and `X | None`; it also
+accepts type expressions such as `list[Order]` or `Cat | Dog`. A class that
+has no declaration, such as one from another library, is registered with
+`codec.register(cls, name="com.example.Name")` and then encodes and decodes
+with that codec only.
+
 Fields match by name, not position. Missing fields take their defaults;
 missing required fields raise `DecodeError`. Unknown fields are consumed and
-ignored. Field naming must not map multiple Python attributes to the same
-wire name: `user_name` and `userName` conflict under `"camelCase"`.
+ignored. Field names are sent in camelCase by default; pass
+`field_naming=None` to `java_class` or `register` to send Python names
+unchanged. Field naming must not map multiple Python attributes to the same
+wire name: `user_name` and `userName` conflict.
 
 Dataclass and attrs decoding bypasses `__init__`, fills fields, then invokes
 `__post_init__` or `__attrs_post_init__`. Dataclass InitVars use their defaults;
@@ -265,21 +282,83 @@ required InitVars needed by post-init are rejected at registration. attrs
 validators and converters do not run. Annotations are not validated. Use a
 validation hook or a Converter when validation is required.
 
+### Java types a Python value cannot express
+
+A Python `int` may be a Java `int`, `long`, or `BigInteger`, and an aware
+`datetime` a `Date`, `Instant`, `OffsetDateTime`, or `ZonedDateTime`. Java
+converts where it declares the type: an `int` reads into a `long` field.
+It does not convert into `BigInteger`, `Instant`, `OffsetDateTime`, and
+`ZonedDateTime`, nor in positions that do not declare the type, such as
+`Object` and a value read as a raw `List` whose `Long` elements Java's
+generics erase. There, annotate the value with `hessian2.Long`,
+`hessian2.BigInteger`, `hessian2.Instant`, `hessian2.OffsetDateTime`, or
+`hessian2.ZonedDateTime`. Values stay plain `int` and `datetime`, and type
+checkers read the annotations as those types:
+
+```python
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TypedDict
+
+import hessian2
+
+
+class Extra(TypedDict):  # A Java Map<String, Object> with known keys
+    order_ref: hessian2.Long
+    note: str
+
+
+@hessian2.java_class("com.example.Payment")
+@dataclass
+class Payment:
+    payment_id: int  # A Java long field reads an int
+    amount: hessian2.BigInteger
+    paid_at: hessian2.Instant
+    item_ids: list[hessian2.Long]  # A Java List<Long>
+    extra: Extra
+
+
+payment = Payment(
+    1, 5, datetime(2026, 1, 1, tzinfo=UTC), [7, 8], {"order_ref": 9, "note": "ok"}
+)
+codec = hessian2.Codec()
+codec.register(Payment)
+received = codec.loads(codec.dumps(payment))
+print(received.amount, received.item_ids, received.paid_at.isoformat())
+# 5 [7, 8] 2026-01-01T00:00:00+00:00
+
+# A top-level value has no field annotation; pass its type instead.
+ids = hessian2.dumps([7, 8], type=list[hessian2.Long])
+print(hessian2.loads(ids))  # [7, 8]
+```
+
+`dumps_many(values, types=[...])` takes one annotation per value, or `None`.
+`codec.java_name(tp)` returns the Java class a type always encodes as, such
+as `"com.example.Payment"` or `"java.math.BigInteger"`, and `None` for types
+like `int` and `list` that map to several Java types.
+
+A list, set, or dict that appears again in the same stream is written as a
+reference to the first, so Java shares one object, unless that position has
+tags other than the first one's: a Java object holds one type, so the value
+is written again, as pydantic writes each position by its own annotation. A
+position without tags refers to the first.
+
 ### Options and registration conflicts
 
 ```python
 import hessian2
 
 codec = hessian2.Codec(
-    field_naming="camelCase",  # None keeps Python field names unchanged
     unknown_class="raise",  # "hessian_object" or "dict" for unknown names
     max_depth=256,  # Maximum nesting of objects, lists, and maps
 )
 ```
 
-Duplicate registration of the same type under the same name is allowed.
-A name assigned to a different type, or a type assigned to a different name,
-raises `ValueError` unless you explicitly pass `replace=True`:
+`loads` and `loads_many` take `unknown_class=` to override the codec's
+setting for one call. Duplicate registration of the same type under the same
+name is allowed. A name assigned to a different type, or a type assigned to a
+different name, raises `ValueError` unless you explicitly pass
+`replace=True`:
 
 ```python
 from dataclasses import dataclass
@@ -299,16 +378,17 @@ class NewPoint:
 
 
 codec = hessian2.Codec()
-codec.register("com.example.Point", OldPoint)
+codec.register(OldPoint, name="com.example.Point")
 # Explicit replacement; without replace=True this raises ValueError.
-codec.register("com.example.Point", NewPoint, replace=True)
+codec.register(NewPoint, name="com.example.Point", replace=True)
 point = codec.loads(codec.dumps(NewPoint(3, 4)))
 print(point)  # NewPoint(x=3, y=4)
 ```
 
 `replace=True` can also override built-in JDK mappings. Moving a type to a
 new encoding name keeps its old name as a decode alias. There is no global
-registry; the module-level functions use only the built-in mappings.
+registry: the module-level functions encode declared classes and decode
+only built-in types.
 
 ### Pydantic and other types
 
@@ -328,12 +408,12 @@ class Order(BaseModel):
 
 codec = hessian2.Codec()
 codec.register(
-    "com.example.Order",
     hessian2.Converter(
         Order,
         to_fields=Order.model_dump,
         from_fields=Order.model_validate,
     ),
+    name="com.example.Order",
 )
 order = Order(order_id=1, amount=9.5)
 received = codec.loads(codec.dumps(order))
@@ -385,6 +465,8 @@ its fields. The setting also applies to nested unknown objects.
 | aware `datetime` | java.util.Date; decoded in UTC, millisecond precision |
 | naive `datetime`, `date`, naive `time`, `timedelta` | LocalDateTime, LocalDate, LocalTime, Duration |
 | `Decimal`, `UUID` | BigDecimal, UUID |
+| `hessian2.Long`, `hessian2.BigInteger` annotations on an `int` | long, BigInteger |
+| `hessian2.Instant`, `OffsetDateTime`, `ZonedDateTime` annotations on an aware `datetime` | the `java.time` class |
 
 Typed Java lists and arrays decode as Python lists; typed maps decode as
 dicts. Instant, OffsetDateTime, and ZonedDateTime decode as aware datetimes;
@@ -398,8 +480,11 @@ Tested in both directions with Caucho Hessian 4.0.66, hessian-lite 4.0.5,
 and dubbo-go-hessian2 1.13.3. Java implementations determine the forms this
 writer emits; individual type mappings still differ between peers.
 
-- Java can read an int encoding into a long field. In an `Object` or generic
-  collection, however, a small Python integer arrives as `Integer`, not `Long`.
+- Java reads an int encoding into a `long` or `Long` field, and hessian-lite
+  also into the elements of a `List<Long>` or `Map<String, Long>` field. A
+  small integer still arrives as `Integer` in an `Object` position, a value
+  read as a raw `List` (as `readObject(List.class)` does), and Caucho's
+  generic fields; annotate it with `hessian2.Long` there.
 - Caucho sends `0.1f` as its exact double value (`0.10000000149011612`);
   hessian-lite sends its shortest decimal (`0.1`). Both incoming values are
   preserved as sent. Java's writer also drops negative zero's sign.
@@ -419,9 +504,11 @@ descriptors, default factories, post-init hooks, Converter callbacks, and map
 key methods can run Python code. Field annotations do not validate input.
 
 `DecodeError` subclasses `ValueError`; `EncodeError` subclasses `TypeError`.
-Excess encoding depth raises `RecursionError`. Lengths and references are
-checked, but `max_depth` does not cap total memory or CPU use. Limit incoming
-message size in the application. See [SECURITY.md](SECURITY.md).
+A `ValueError` or `TypeError` from a converter, post-init method, default
+factory, or field getter is raised as `DecodeError` or `EncodeError`, with
+the original as its `__cause__`. Excess encoding depth raises `EncodeError`.
+Lengths and references are checked, but `max_depth` does not cap total
+memory or CPU use. Limit incoming message size in the application. See [SECURITY.md](SECURITY.md).
 
 ## Development and community
 

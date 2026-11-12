@@ -40,6 +40,9 @@ import com.caucho.hessian.test.TestHessian2Servlet;
  * describe READER DIR   reads each DIR/NAME.bin with READER and prints
  *                       {NAME: description or {"error": message}}; suite values also run arg*
  * inventory            all arg* methods and their matching reply* names
+ * types READER DIR      reads each DIR/NAME.bin as the Java type DIR/NAME.type
+ *                       names, as an RPC provider reads a declared parameter,
+ *                       and prints {NAME: the Java classes it holds}
  * </pre>
  */
 public final class Interop {
@@ -48,6 +51,7 @@ public final class Interop {
             case "write" -> write(Path.of(args[1]));
             case "describe" -> describe(args[1], Path.of(args[2]));
             case "inventory" -> inventory();
+            case "types" -> types(args[1], Path.of(args[2]));
             default -> throw new IllegalArgumentException(args[0]);
         }
     }
@@ -162,6 +166,35 @@ public final class Interop {
                 }
                 json.append(first ? "" : ",\n").append(Json.string(name.substring(0, name.length() - 4)))
                     .append(": ").append(description);
+                first = false;
+            }
+        }
+        System.out.println(json.append("}"));
+    }
+
+    /** What Java types a value read as a declared type holds: its class, item and value classes, fields. */
+    static void types(String reader, Path dir) throws Exception {
+        StringBuilder json = new StringBuilder("{");
+        boolean first = true;
+        try (var files = Files.list(dir)) {
+            for (Path file : files.sorted().toList()) {
+                String name = file.getFileName().toString();
+                if (!name.endsWith(".bin")) {
+                    continue;
+                }
+                name = name.substring(0, name.length() - 4);
+                Class<?> type = Class.forName(Files.readString(dir.resolve(name + ".type")).strip());
+                ByteArrayInputStream input = new ByteArrayInputStream(Files.readAllBytes(file));
+                String description;
+                try {
+                    Object value = reader.equals("caucho")
+                        ? new com.caucho.hessian.io.Hessian2Input(input).readObject(type)
+                        : new com.alibaba.com.caucho.hessian.io.Hessian2Input(input).readObject(type);
+                    description = Types.of(value);
+                } catch (Throwable error) {
+                    description = "{\"error\": " + Json.string(String.valueOf(error)) + "}";
+                }
+                json.append(first ? "" : ",\n").append(Json.string(name)).append(": ").append(description);
                 first = false;
             }
         }
@@ -372,6 +405,59 @@ final class Describe {
         }
         return out.append("}}").toString();
     }
+}
+
+/** The Java classes a value holds, for checking which types a peer received. */
+final class Types {
+    static String of(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        StringBuilder out = new StringBuilder("{\"class\": " + Json.string(value.getClass().getName()));
+        if (value instanceof Collection<?> items) {
+            out.append(", \"items\": ").append(classes(items));
+        } else if (value instanceof Map<?, ?> map) {
+            out.append(", \"values\": ").append(classes(map.values()));
+        } else if (value instanceof Throwable error) {
+            out.append(", \"message\": ").append(Json.string(String.valueOf(error.getMessage())));
+        } else if (value instanceof Typed) {
+            out.append(", \"fields\": {");
+            boolean first = true;
+            for (Field field : Typed.class.getDeclaredFields()) {
+                try {
+                    out.append(first ? "" : ", ").append(Json.string(field.getName())).append(": ")
+                        .append(of(field.get(value)));
+                } catch (IllegalAccessException error) {
+                    throw new IllegalStateException(error);
+                }
+                first = false;
+            }
+            out.append("}");
+        }
+        return out.append("}").toString();
+    }
+
+    private static String classes(Collection<?> items) {
+        StringBuilder out = new StringBuilder("[");
+        boolean first = true;
+        for (Object item : items) {
+            out.append(first ? "" : ", ").append(Json.string(item == null ? "null" : item.getClass().getName()));
+            first = false;
+        }
+        return out.append("]").toString();
+    }
+}
+
+/** Fields of the Java types that do not convert from Python's default forms. */
+class Typed implements Serializable {
+    java.math.BigInteger amount;
+    List<java.math.BigInteger> amounts;
+    java.time.Instant instant;
+    java.time.OffsetDateTime offset;
+    java.time.ZonedDateTime zoned;
+    List<Long> ids;
+    Map<String, Object> extra;
+    Object any;
 }
 
 final class Json {
@@ -598,6 +684,26 @@ final class Extras {
 
     static java.math.BigInteger bigint_word_boundary() {
         return java.math.BigInteger.ONE.shiftLeft(64);
+    }
+
+    /** The Java types Python writes only with tags, in a class's fields. */
+    static Typed typed_fields() {
+        Typed typed = typed_without_time();
+        typed.instant = time_instant();
+        typed.offset = time_offset_datetime();
+        typed.zoned = time_zoned_datetime();
+        return typed;
+    }
+
+    /** {@link #typed_fields} without java.time, which Caucho cannot write on JDK 17. */
+    static Typed typed_without_time() {
+        Typed typed = new Typed();
+        typed.amount = java.math.BigInteger.valueOf(5);
+        typed.amounts = new ArrayList<>(List.of(java.math.BigInteger.valueOf(6)));
+        typed.ids = new ArrayList<>(List.of(7L));
+        typed.extra = new java.util.HashMap<>(Map.of("count", 8L));
+        typed.any = 9L;
+        return typed;
     }
 
     static java.math.BigInteger bigint_small() {

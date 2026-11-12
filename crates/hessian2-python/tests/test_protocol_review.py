@@ -108,10 +108,11 @@ def test_tables_reset_between_calls_and_class_shapes_stay_distinct():
 def test_registered_object_can_reference_itself_before_completion():
     codec = hessian2.Codec()
 
-    @codec.register("Node")
     @dataclass
     class Node:
         self: object = None
+
+    codec.register(Node, name="Node", field_naming=None)
 
     node = codec.loads(b"C\x04Node\x91\x04self\x60Q\x90")
     assert node.self is node
@@ -120,16 +121,18 @@ def test_registered_object_can_reference_itself_before_completion():
 def test_converter_and_enum_reference_slots():
     codec = hessian2.Codec()
 
-    @codec.register("E")
     class E(Enum):
         A = 1
+
+    codec.register(E, name="E", field_naming=None)
 
     @dataclass
     class Box:
         value: object
 
     codec.register(
-        "Box", hessian2.Converter(Box, lambda x: {"value": x.value}, lambda f: Box(**f))
+        hessian2.Converter(Box, lambda x: {"value": x.value}, lambda f: Box(**f)),
+        name="Box",
     )
     box = Box(1)
     a, b, c, d = codec.loads_many(codec.dumps_many([E.A, box, E.A, box]))

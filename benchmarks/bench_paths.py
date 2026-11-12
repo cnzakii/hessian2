@@ -15,7 +15,6 @@ import pyperf
 codec = hessian2.Codec()
 
 
-@codec.register("Point")
 @dataclasses.dataclass
 class Point:
     number: int
@@ -24,21 +23,24 @@ class Point:
     enabled: bool
 
 
+codec.register(Point, name="Point", field_naming=None)
+
+
 class Converted:
     pass
 
 
 codec.register(
-    "Converted",
     hessian2.Converter(
         Converted,
         to_fields=lambda value: {f"f{i}": i for i in range(32)},
         from_fields=lambda fields: Converted(),
     ),
+    name="Converted",
 )
 
 wide = dataclasses.make_dataclass("Wide", [(f"f{i}", int) for i in range(1024)])
-codec.register("Wide", wide)
+codec.register(wide, name="Wide", field_naming=None)
 shared = Converted()
 CASES = {
     "ascii": "a" * 1_000_000,
