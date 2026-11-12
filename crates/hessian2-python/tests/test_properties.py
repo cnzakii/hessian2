@@ -105,7 +105,9 @@ def test_arbitrary_bytes(data: bytes) -> None:
     decodes_or_rejects(data)
 
 
-FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "java.json").read_text())
+FIXTURES = json.loads(
+    (Path(__file__).parent / "fixtures" / "java.json").read_text(encoding="utf-8")
+)
 SMALL = [
     base64.b64decode(data)
     for case in FIXTURES.values()

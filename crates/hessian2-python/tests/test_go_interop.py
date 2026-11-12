@@ -19,7 +19,9 @@ import pytest
 from describe import describe, unordered
 
 ROOT = Path(__file__).resolve().parents[3]
-FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "go.json").read_text())
+FIXTURES = json.loads(
+    (Path(__file__).parent / "fixtures" / "go.json").read_text(encoding="utf-8")
+)
 CODEC = hessian2.Codec(unknown_class="hessian_object")
 NAMES = sorted(FIXTURES)
 
@@ -55,7 +57,7 @@ def go_views(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
         [GO or "go", "run", ".", "describe", str(directory)],
         cwd=ROOT / "interop" / "go",
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)

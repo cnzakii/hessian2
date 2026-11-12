@@ -8,75 +8,66 @@
 [![MIT license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [Hessian 2.0](http://hessian.caucho.com/doc/hessian-serialization.html)
-serialization for Python, implemented in Rust. Exchange nested objects,
-collections, dates, and shared references with Java and Go Hessian peers.
+serialization for Python, implemented in Rust.
 
-Requires CPython 3.11+. The Python package has no runtime dependencies.
-The Rust core has no dependencies, and both crates forbid unsafe code.
+- **Python objects, not just dictionaries.** Register dataclasses, attrs classes,
+  named tuples, and enums; adapt other types with a Converter.
+- **Nested values and shared references.** Encode an object graph and recover
+  its registered types and shared objects on decode.
+- **Java-compatible mappings.** Exchange collections, dates, decimals, UUIDs,
+  and registered objects with Java and Go Hessian peers.
 
-> Alpha: APIs may change before a stable release. The package has not yet
-> been published from this repository.
+On the [large-text benchmarks below](#performance), hessian2 encodes at
+**1.7–12.3×** and decodes at **1.5–18.0×** the speed of Java Caucho Hessian.
+These results measure roughly 1 MB strings, not small messages or object graphs.
 
-## Hessian across languages
+Requires CPython 3.11+ with no runtime dependencies. The independent
+[Rust core](crates/hessian2-core/README.md) has no dependencies; both crates
+forbid unsafe code.
 
-The wire format is tested against these pinned implementations, in both
-directions—not just by encoding and decoding with the same Python library:
+> Alpha: APIs may change before a stable release.
 
-| Peer | Version | What the tests check |
-|---|---|---|
-| Java Caucho Hessian | 4.0.66 | Reference conformance cases, compact numbers, string chunks, objects, references, and JDK values |
-| Java hessian-lite | 4.0.5 | The same cases, plus its `java.time` handle forms |
-| Go dubbo-go-hessian2 | 1.13.3 | Numbers, text, binary, collections, dates, and nested registered objects |
+## Installation
 
-Java determines the forms this writer emits. Java implementations differ in
-some value mappings, and Go has its own edge cases; see
-[interoperability details](#interoperability-details). This is tested
-interoperability, not a claim that every library supports every Java class.
-
-### Same-protocol performance
-
-Complete calls on large strings, in **µs, encode / decode**; lower is better.
-All readers consume the **same Hessian bytes**. Both Java writers were also
-checked to emit exactly those bytes for these samples.
-
-| Input | Python hessian2 | Java Caucho | Java hessian-lite | Go Hessian |
-|---|---:|---:|---:|---:|
-| ASCII | **71 / 110** | 869 / 1,990 | 867 / 1,946 | 2,228 / 520 |
-| Chinese | **162 / 552** | 476 / 1,452 | 495 / 1,258 | 1,773 / 669 |
-| Mixed text | **390** / 1,089 | 664 / 1,611 | 635 / 1,650 | 1,915 / **864** |
-| Emoji | **435 / 900** | 730 / 1,761 | 723 / 1,873 | 1,397 / 22,651 |
-
-Apple M4, macOS, CPython 3.13.12, OpenJDK 17.0.20, Go 1.26.4; release builds,
-warmed inputs, median of five rounds of 20 calls. Samples are roughly
-0.9–1 MB of UTF-8. Java encoding includes copying the complete output byte
-array. These are large-string measurements, not a general ranking of the
-languages or object workloads.
-
-Go's decoder is sensitive to chunk layout: on its own output, mixed text
-was 649 µs and emoji 4,081 µs, versus 864 µs and 22,651 µs on the common
-input. Do not compare those two layouts as if they were identical workloads.
-
-Reproduce after building the release extension and Java harness:
+Requires CPython 3.11+. Install with pip:
 
 ```console
-make interop-java
-uv run --locked --group bench python benchmarks/bench_hessian.py --iterations 20 --rounds 5
+python -m pip install hessian2
 ```
 
-## Quick start: nested objects and shared references
-
-From a source checkout, build the Python package with uv and Rust installed:
+Or add it to a uv project:
 
 ```console
-uv sync --locked
-uv --directory crates/hessian2-python run --locked maturin develop --release
+uv add hessian2
 ```
 
-Register the Java names your peer uses. Here a user has two address fields
-that point to **the same Address instance**, not two equal copies:
+For source builds and development setup, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Quick start
+
+For plain values, use the module-level functions:
+
+```python
+import hessian2
+
+payload = hessian2.dumps({"name": "alice", "tags": ["customer"]})
+received = hessian2.loads(payload)
+print(received["tags"])  # ['customer']
+```
+
+### Nested objects, references, and built-in types
+
+Register the Java class names your peer uses. Here an order contains a
+customer and an address, and both address fields point to **the same
+Address instance**. Decimal, UUID, and an aware datetime use the built-in
+Java mappings without registration.
 
 ```python
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import UUID
 
 import hessian2
 
@@ -90,31 +81,46 @@ class Address:
     postal_code: str
 
 
-@codec.register("com.example.User")
+@codec.register("com.example.Customer")
 @dataclass
-class User:
+class Customer:
     user_name: str
-    home_address: Address
+    address: Address
+
+
+@codec.register("com.example.Order")
+@dataclass
+class Order:
+    order_id: UUID
+    customer: Customer
     delivery_address: Address
+    total: Decimal
+    created_at: datetime
     tags: list[str]
 
 
 address = Address(city="Hangzhou", postal_code="310000")
-user = User(
-    user_name="alice",
-    home_address=address,
+order = Order(
+    order_id=UUID("123e4567-e89b-12d3-a456-426614174000"),
+    customer=Customer(user_name="alice", address=address),
     delivery_address=address,
-    tags=["customer", "newsletter"],
+    total=Decimal("19.90"),
+    created_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+    tags=["paid", "delivery"],
 )
 
-# Python names become Java fields: userName, homeAddress, postalCode, ...
-# The shared address is sent once; the second field is a Hessian reference.
-payload = codec.dumps(user)
+# Python names become Java fields: orderId, deliveryAddress, postalCode, ...
+# The address is sent once; the second occurrence is a Hessian reference.
+payload = codec.dumps(order)
 received = codec.loads(payload)
 
-print(received.user_name)  # alice
-print(received.home_address.city)  # Hangzhou
-print(received.home_address is received.delivery_address)  # True
+print(received.customer.user_name)  # alice
+print(received.delivery_address.city)  # Hangzhou
+print(received.customer.address is received.delivery_address)  # True
+print(received.total, type(received.total).__name__)  # 19.90 Decimal
+print(received.order_id, type(received.order_id).__name__)
+# 123e4567-e89b-12d3-a456-426614174000 UUID
+print(received.created_at.isoformat())  # 2026-01-01T12:00:00+00:00
 ```
 
 Registration applies throughout the object graph: nested values can be
@@ -124,15 +130,7 @@ and `HessianObject` values also support cycles. Registered named tuples
 reject cycles during encoding; Converter values cannot be referenced back
 to while their fields are being decoded.
 
-For plain values, use the module-level functions without creating a codec:
-
-```python
-import hessian2
-
-payload = hessian2.dumps({"name": "alice", "tags": ["customer"]})
-received = hessian2.loads(payload)
-print(received["tags"])  # ['customer']
-```
+### Multiple values in one stream
 
 `loads` accepts bytes-like input and requires exactly one value. Use
 `dumps_many` / `loads_many` for several top-level values sharing a stream's
@@ -146,6 +144,108 @@ stream = hessian2.dumps_many(["header", shared, shared])
 header, first, second = hessian2.loads_many(stream)
 print(header, first["status"], first is second)  # header ready True
 ```
+
+## Performance
+
+The primary comparison is **Java Caucho Hessian**, the reference implementation.
+Across four roughly 1 MB text samples, hessian2's encoding speed is
+**1.7–12.3× Caucho's**, and decoding speed is **1.5–18.0× Caucho's**.
+
+### Encoding
+
+Each row measures one complete `dumps` call. Lower times are better;
+the last column is Caucho's time divided by hessian2's time.
+
+| Text | hessian2 | Java Caucho | hessian2 speed relative to Caucho |
+|---|---:|---:|---:|
+| ASCII | 71 µs | 869 µs | **12.3×** |
+| Chinese | 162 µs | 476 µs | **2.9×** |
+| Mixed | 390 µs | 664 µs | **1.7×** |
+| Emoji | 435 µs | 730 µs | **1.7×** |
+
+### Decoding
+
+Each row measures one complete `loads` call on the **same Hessian bytes**
+for both implementations.
+
+| Text | hessian2 | Java Caucho | hessian2 speed relative to Caucho |
+|---|---:|---:|---:|
+| ASCII | 110 µs | 1,990 µs | **18.0×** |
+| Chinese | 552 µs | 1,452 µs | **2.6×** |
+| Mixed | 1,089 µs | 1,611 µs | **1.5×** |
+| Emoji | 900 µs | 1,761 µs | **2.0×** |
+
+These results cover large strings, **not** small messages, registered objects,
+or every platform. They do not establish a general ranking of the languages.
+
+<details>
+<summary>hessian-lite and Go results</summary>
+
+Against Java hessian-lite, encoding speed is **1.6–12.2×** and decoding
+speed **1.5–17.7×**. Against Go Hessian, encoding speed is **3.2–31.5×**;
+decoding is workload-dependent: **Go is faster on mixed text**, where
+hessian2 takes 26% more time.
+
+All values below are microseconds per complete call; lower is better.
+The hessian2 timings are in the tables above.
+
+| Text | hessian-lite encode | hessian-lite decode | Go encode | Go decode |
+|---|---:|---:|---:|---:|
+| ASCII | 867 | 1,946 | 2,228 | 520 |
+| Chinese | 495 | 1,258 | 1,773 | 669 |
+| Mixed | 635 | 1,650 | 1,915 | 864 |
+| Emoji | 723 | 1,873 | 1,397 | 22,651 |
+
+Go's decoder is sensitive to chunk layout. On its own output, mixed-text
+decoding takes 649 µs and emoji 4,081 µs, rather than 864 µs and 22,651 µs
+on the shared input. The large emoji gap therefore depends heavily on
+which writer produced the bytes.
+
+</details>
+
+<details>
+<summary>Benchmark setup and reproduction</summary>
+
+Apple M4, macOS, CPython 3.13.12, OpenJDK 17.0.20, Go 1.26.4.
+Peers: Caucho Hessian 4.0.66, hessian-lite 4.0.5, dubbo-go-hessian2 1.13.3.
+Release builds, warmed inputs, median of five rounds of 20 calls.
+
+Samples contain roughly 0.9–1 MB of UTF-8: ASCII, Chinese, sparse emoji
+mixed with English and Chinese, and emoji only. Every decoder reads the
+same Hessian bytes. Both Java writers also produce exactly those bytes
+for these samples. Java encoding includes copying the complete output
+byte array. Multipliers use unrounded timings; displayed times are rounded.
+
+With the release extension installed, JDK 17+ and Go available:
+
+```console
+make interop-java
+uv run --locked --group bench python benchmarks/bench_hessian.py --iterations 20 --rounds 5
+```
+
+Results are written to `target/hessian-benchmark/results.json`.
+For short strings, ordinary objects, wide classes, big integers, and repeated
+references, use `benchmarks/bench_paths.py` for regression measurements.
+
+</details>
+
+<details>
+<summary>Comparing with other Python formats</summary>
+
+`pickle`, MessagePack, and JSON do not emit Hessian bytes. Compare them when
+choosing a format, not when choosing an implementation for a Hessian peer.
+
+```console
+uv run --locked --group bench python benchmarks/bench.py --fast -o target/formats.json
+```
+
+The `users` workload contains dataclasses. hessian2 and pickle reconstruct
+those classes; msgpack calls `dataclasses.asdict` during encoding, orjson
+encodes dataclasses natively, and both return dictionaries. Decimal/UUID
+conversion and binary representation also differ. These measurements
+compare application costs, not interchangeable formats.
+
+</details>
 
 ## Registered classes
 
@@ -294,7 +394,11 @@ ZonedDateTime keeps its zone when `zoneinfo` knows it. Java nanoseconds are
 truncated to Python microseconds. An aware `time` has no default Java mapping
 and raises `EncodeError`.
 
-### Interoperability details
+## Compatibility
+
+Tested in both directions with Caucho Hessian 4.0.66, hessian-lite 4.0.5,
+and dubbo-go-hessian2 1.13.3. Java implementations determine the forms this
+writer emits; individual type mappings still differ between peers.
 
 - Java can read an int encoding into a long field. In an `Object` or generic
   collection, however, a small Python integer arrives as `Integer`, not `Long`.
@@ -320,29 +424,6 @@ key methods can run Python code. Field annotations do not validate input.
 Excess encoding depth raises `RecursionError`. Lengths and references are
 checked, but `max_depth` does not cap total memory or CPU use. Limit incoming
 message size in the application. See [SECURITY.md](SECURITY.md).
-
-## Other Python formats
-
-For Python-only workloads, compare against the format you actually need.
-`pickle`, MessagePack, and JSON do not emit Hessian bytes, and may return
-plain dictionaries instead of registered Python classes.
-
-The format comparison runs all of them on the same source values:
-
-```console
-uv run --locked --group bench python benchmarks/bench.py --fast -o target/formats.json
-```
-
-`users` uses dataclasses: hessian2 and pickle reconstruct those classes;
-msgpack calls `dataclasses.asdict` during encoding, while orjson encodes
-dataclasses natively, and both return dictionaries. Decimal/UUID conversion
-and binary representation also differ. These numbers compare application
-costs, not interchangeable formats.
-
-For regression measurements of short strings, ordinary objects, wide
-classes, big integers, and repeated references, use
-`benchmarks/bench_paths.py`. Results depend on machine, interpreter, input
-shape, and whether Python has cached a string's UTF-8 representation.
 
 ## Development and community
 

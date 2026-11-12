@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use hessian2_core::{ErrorKind, Reader, Token, Writer, text};
+use hessian2_core::{ErrorKind, MAX_SKIP_DEPTH, Reader, Token, Writer, text};
 
 // Observed with Caucho 4.0.66 and hessian-lite 4.0.5 TestHessian2Servlet.
 #[test]
@@ -79,6 +79,8 @@ fn doubles_use_java_multiplication_for_thousandths() {
         (0.001, b"\x5f\0\0\0\x01"),
         (-0.001, b"\x5f\xff\xff\xff\xff"),
         (65.536, b"\x5f\0\x01\0\0"),
+        (32768.0, b"\x5f\x01\xf4\0\0"),
+        (2147483647.0, b"DA\xdf\xff\xff\xff\xc0\0\0"),
     ] {
         let mut writer = Writer::new();
         writer.write_double(value);
@@ -208,7 +210,7 @@ fn list_forms_and_shared_type_table() {
         reader.skip().unwrap();
         assert!(reader.is_empty());
     }
-    for len in 0..=7 {
+    for len in [0, 1, 2, 3, 4, 5, 6, 7, 8, 47, 48, 1024] {
         for typed in [true, false] {
             let mut writer = Writer::new();
             writer.begin_list(len, typed.then_some("t"));
@@ -217,9 +219,28 @@ fn list_forms_and_shared_type_table() {
             }
             assert_eq!(
                 writer.as_bytes()[0],
-                if typed { 0x70 } else { 0x78 } + len as u8
+                match (typed, len) {
+                    (true, 0..=7) => 0x70 + len as u8,
+                    (false, 0..=7) => 0x78 + len as u8,
+                    (true, _) => b'V',
+                    (false, _) => b'X',
+                }
             );
-            Reader::new(writer.as_bytes()).skip().unwrap();
+            let mut reader = Reader::new(writer.as_bytes());
+            assert_eq!(
+                reader.next_token().unwrap(),
+                Token::List {
+                    type_name: typed.then_some(0),
+                    len: Some(len),
+                }
+            );
+            if typed {
+                assert_eq!(reader.type_name(0), "t");
+            }
+            for _ in 0..len {
+                assert_eq!(reader.next_token().unwrap(), Token::Null);
+            }
+            assert!(reader.is_empty());
         }
     }
     let wire = b"M\x01tZ\x70\x90U\x90ZV\x90\x90M\x90Z";
@@ -255,6 +276,159 @@ fn class_and_reference_indexes_survive_multiple_top_level_values() {
     assert_eq!(reader.next_token().unwrap(), Token::Ref(0));
     assert_eq!(reader.next_token().unwrap(), Token::Ref(18));
     assert!(reader.is_empty());
+}
+
+#[test]
+fn errors_report_the_kind_and_failing_byte() {
+    for (wire, kind, offset, message) in [
+        (
+            &b"I\0"[..],
+            ErrorKind::UnexpectedEof,
+            2,
+            "unexpected end of input",
+        ),
+        (
+            b"Z",
+            ErrorKind::UnexpectedTag(b'Z'),
+            0,
+            "unexpected tag 0x5a",
+        ),
+        (
+            b"X\x80",
+            ErrorKind::InvalidLength,
+            1,
+            "length exceeds the remaining input",
+        ),
+        (
+            b"\x01\xff",
+            ErrorKind::InvalidString,
+            1,
+            "invalid string data",
+        ),
+        (
+            b"\x60",
+            ErrorKind::UnknownClass,
+            0,
+            "reference to an undefined class",
+        ),
+        (
+            b"U\x90",
+            ErrorKind::UnknownType,
+            1,
+            "reference to an undefined type",
+        ),
+        (
+            b"Q\x90",
+            ErrorKind::UnknownRef,
+            0,
+            "reference to an unread value",
+        ),
+    ] {
+        let mut bytes = vec![b'N'];
+        bytes.extend_from_slice(wire);
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.next_token().unwrap(), Token::Null);
+        let error = reader.next_token().unwrap_err();
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.offset(), offset + 1);
+        assert_eq!(
+            error.to_string(),
+            format!("{message} at byte {}", offset + 1)
+        );
+    }
+    let bytes = vec![0x79; MAX_SKIP_DEPTH + 1];
+    let error = Reader::new(&bytes).skip().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::DepthLimit);
+    assert_eq!(error.offset(), MAX_SKIP_DEPTH);
+    assert_eq!(
+        error.to_string(),
+        format!("values nest too deeply at byte {MAX_SKIP_DEPTH}")
+    );
+}
+
+#[test]
+fn error_display_propagates_output_failures() {
+    use std::fmt::{self, Write};
+
+    struct FailingOutput;
+    impl Write for FailingOutput {
+        fn write_str(&mut self, _: &str) -> fmt::Result {
+            Err(fmt::Error)
+        }
+    }
+
+    let error = Reader::new(b"Z").next_token().unwrap_err();
+    assert!(write!(FailingOutput, "{error}").is_err());
+}
+
+#[test]
+fn malformed_metadata_and_chunk_headers_report_their_position() {
+    for (wire, kind, offset) in [
+        (&b"U"[..], ErrorKind::UnexpectedEof, 1),
+        (b"QN", ErrorKind::UnexpectedTag(b'N'), 1),
+        (b"CN", ErrorKind::UnexpectedTag(b'N'), 1),
+        (b"C\x01X\x91N", ErrorKind::UnexpectedTag(b'N'), 4),
+        (b"R\0\x01aN", ErrorKind::UnexpectedTag(b'N'), 4),
+        (b"A\0\x01aN", ErrorKind::UnexpectedTag(b'N'), 4),
+        (b"R\0\x01a", ErrorKind::UnexpectedEof, 4),
+        (b"A\0\x01a", ErrorKind::UnexpectedEof, 4),
+        (b"W", ErrorKind::UnexpectedEof, 1),
+        (b"H\x90", ErrorKind::UnexpectedEof, 2),
+    ] {
+        let error = Reader::new(wire).skip().unwrap_err();
+        assert_eq!((error.kind(), error.offset()), (kind, offset), "{wire:x?}");
+    }
+}
+
+#[test]
+fn offsets_follow_reading_skipping_and_container_ends() {
+    let mut writer = Writer::new();
+    writer.write_bool(true);
+    writer.write_bool(false);
+    writer.write_str("é");
+    writer.begin_map(None);
+    writer.write_str("key");
+    writer.write_null();
+    writer.end_map();
+    assert_eq!(writer.as_bytes(), b"TF\x01\xc3\xa9H\x03keyNZ");
+    let mut reader = Reader::new(writer.as_bytes());
+    assert_eq!(reader.offset(), 0);
+    for (token, offset) in [(Token::Bool(true), 1), (Token::Bool(false), 2)] {
+        assert_eq!(reader.next_token().unwrap(), token);
+        assert_eq!(reader.offset(), offset);
+    }
+    reader.skip().unwrap();
+    assert_eq!(reader.offset(), 5);
+    assert_eq!(reader.next_token().unwrap(), Token::Map { type_name: None });
+    assert!(!reader.end().unwrap());
+    assert_eq!(reader.offset(), 6);
+    reader.skip().unwrap();
+    reader.skip().unwrap();
+    assert_eq!(reader.offset(), 11);
+    assert!(reader.end().unwrap());
+    assert_eq!(reader.offset(), writer.as_bytes().len());
+    assert!(reader.is_empty());
+    let error = reader.end().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    assert_eq!(error.offset(), reader.offset());
+}
+
+#[test]
+fn two_byte_unicode_boundaries_round_trip() {
+    let value = "\u{80}é\u{7ff}";
+    let units: Vec<_> = value.encode_utf16().collect();
+    assert_eq!(text::cesu8_to_utf16(value.as_bytes()), Some(units.clone()));
+    let mut bytes = Vec::new();
+    text::push_cesu8(&mut bytes, &units);
+    assert_eq!(bytes, value.as_bytes());
+    assert_eq!(text::cesu8_to_utf8(&bytes).as_deref(), Some(value));
+    let mut writer = Writer::new();
+    writer.write_str(value);
+    assert_eq!(writer.as_bytes()[0], 3);
+    assert_eq!(
+        Reader::new(writer.as_bytes()).next_token().unwrap(),
+        Token::String(bytes.into())
+    );
 }
 
 #[test]
@@ -299,6 +473,11 @@ fn cesu8_validation_rejects_overlong_truncated_and_out_of_range_scalars() {
         b"\xe0\x80\x80",
         b"\xe0\x9f\xbf",
         b"\xe4\xb8",
+        b"\xe4x\x80",
+        b"\xe4\xb8x",
+        b"\xf0x\x80\x80",
+        b"\xf0\x9fx\x80",
+        b"\xf0\x9f\x90x",
         b"\xf0\x80\x80\x80",
         b"\xf0\x9f\x90",
         b"\xf4\x90\x80\x80",

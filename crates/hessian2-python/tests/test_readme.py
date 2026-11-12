@@ -9,12 +9,15 @@ from pathlib import Path
 import pytest
 
 README = Path(__file__).parents[3] / "README.md"
-EXAMPLES = re.findall(r"```python\n(.*?)```", README.read_text(), re.DOTALL)
+EXAMPLES = re.findall(
+    r"```python\n(.*?)```", README.read_text(encoding="utf-8"), re.DOTALL
+)
 
 
 OUTPUTS = [
-    "alice\nHangzhou\nTrue\n",
     "['customer']\n",
+    "alice\nHangzhou\nTrue\n19.90 Decimal\n"
+    "123e4567-e89b-12d3-a456-426614174000 UUID\n2026-01-01T12:00:00+00:00\n",
     "header ready True\n",
     "",
     "NewPoint(x=3, y=4)\n",
