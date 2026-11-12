@@ -32,10 +32,9 @@ UV_PROJECT_ENVIRONMENT=target/dev-314t uv run --locked --python 3.14t pytest
 ```
 
 CI tests the supported Python versions, free-threaded builds, the minimum
-Rust version, and Linux/macOS/Windows. You need not reproduce the whole
-matrix locally, but run the focused tests and `make check`. Python 3.15
-preview jobs are advisory until the test dependencies support the prerelease
-ABI; their failures remain visible and do not satisfy stable-version checks.
+Rust version, and Linux/macOS/Windows. CPython 3.11–3.15 and the free-threaded
+3.14t/3.15t builds are required checks. You need not reproduce the whole
+matrix locally, but run the focused tests and `make check`.
 
 GitHub Actions are pinned to commit SHAs. Dependabot proposes grouped monthly
 updates for Actions, uv dependencies, and both Cargo workspaces; updates are
@@ -77,8 +76,17 @@ The **Coverage** workflow uploads separate `python` and `rust` reports to
 Codecov using GitHub OIDC, without a stored upload token. It also keeps HTML
 reports as Actions artifacts. Python coverage measures the Python package;
 Rust coverage measures the independent core's Rust tests. Neither report
-measures the PyO3 binding's native coverage. Repository owners must authorize
-the Codecov GitHub App if Codecov requires it before accepting uploads.
+measures the PyO3 binding's native coverage. Coverage does not install Java
+or Go; live-peer tests are optional here, and the separate interoperability
+job validates them. Fixture-based tests still run. The locked test dependencies
+include `tzdata`, so timezone tests also run without a system IANA database.
+
+Before the first Codecov upload, the repository owner must sign in to
+[Codecov](https://app.codecov.io/gh/cnzakii/hessian2), authorize the
+[Codecov GitHub App](https://github.com/apps/codecov) for this repository,
+and complete repository setup. OIDC authenticates uploads; it does not replace
+repository setup. An upload rejected with `Repository not found` requires
+checking that setup and repository access, not disabling upload errors.
 
 Reproduce the reports locally:
 
@@ -157,10 +165,10 @@ and free-threaded behavior. Per-version wheels are required; this project
 does not use abi3.
 
 The manually dispatched **Distribution builds** workflow builds and tests
-wheels for Python 3.11–3.14 and 3.14t on Linux x86-64, macOS arm64, and Windows
-x86-64, plus source and Rust archives. It stores workflow artifacts but does
-**not** publish to package indexes. This starter matrix does not promise
-wheels for every architecture or libc.
+wheels for Python 3.11–3.15 and 3.14t/3.15t on Linux x86-64, macOS arm64, and
+Windows x86-64, plus source and Rust archives. It stores workflow artifacts
+but does **not** publish to package indexes. This starter matrix does not
+promise wheels for every architecture or libc.
 
 Publishing requires separate maintainer approval and package-index setup.
 Publish the tested artifacts, tag their exact source commit, and create

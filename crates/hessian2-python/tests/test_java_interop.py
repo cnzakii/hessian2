@@ -22,7 +22,9 @@ import pytest
 from describe import describe, unordered
 
 ROOT = Path(__file__).resolve().parents[3]
-FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "java.json").read_text())
+FIXTURES = json.loads(
+    (Path(__file__).parent / "fixtures" / "java.json").read_text(encoding="utf-8")
+)
 WRITERS = ("caucho", "lite")
 CODEC = hessian2.Codec(unknown_class="hessian_object")
 

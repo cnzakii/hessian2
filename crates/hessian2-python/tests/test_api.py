@@ -495,12 +495,11 @@ def test_converter() -> None:
         def __init__(self, x: int, y: int) -> None:
             self.x, self.y = x, y
 
-    codec.register(
-        "Point",
-        Converter(
-            Point, lambda p: {"x": p.x, "y": p.y}, lambda f: Point(f["x"], f["y"])
-        ),
+    converter = Converter(
+        Point, lambda p: {"x": p.x, "y": p.y}, lambda f: Point(f["x"], f["y"])
     )
+    assert repr(converter) == f"Converter({Point.__qualname__})"
+    codec.register("Point", converter)
     point = codec.loads(codec.dumps(Point(1, 2)))
     assert (point.x, point.y) == (1, 2)
 

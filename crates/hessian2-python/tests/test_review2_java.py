@@ -16,7 +16,7 @@ from test_java_interop import JAVA, WRITERS, needs_java
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "java.json"
 FIXTURES = {
     name: case
-    for name, case in json.loads(FIXTURE_PATH.read_text()).items()
+    for name, case in json.loads(FIXTURE_PATH.read_text(encoding="utf-8")).items()
     if name.startswith("extra.review2_")
 }
 BOUNDARIES = {"extra.review2_zoned_min", "extra.review2_zoned_max"}
