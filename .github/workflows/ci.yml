@@ -78,6 +78,9 @@ jobs:
       - run: uv sync --locked
       - name: Run Python tests
         run: uv run --locked pytest
+      - name: Run the README Pydantic example
+        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.13'
+        run: uv run --locked --group readme pytest crates/hessian2-python/tests/test_readme.py
 
   interop:
     name: Java and Go interoperability

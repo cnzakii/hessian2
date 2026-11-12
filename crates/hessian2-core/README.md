@@ -7,9 +7,8 @@ tokens, and a `Writer` that turns calls into bytes.
 > `hessian2-core` is alpha software. Its API may change before the first
 > stable release.
 
-- **Java-compatible bytes.** The writer picks the forms Java's Hessian
-  implementations (Caucho Hessian 4.0.66 and hessian-lite 4.0.5) pick for the
-  same values, and the reader accepts everything they send.
+- **Java-compatible encoding.** Encoding follows Caucho Hessian 4.0.66 and
+  hessian-lite 4.0.5, with interoperability tests against both implementations.
 - **Per-stream tables.** Both sides keep the class definitions, type names,
   and reference numbers that Hessian shares across the values of one stream.
 - **Zero-copy reading.** Strings and binaries borrow from the input unless
@@ -64,9 +63,9 @@ map, or object whose items follow:
 - `Ref(n)` refers back to the `n`-th list, map, or object started in the
   stream.
 
-Malformed or truncated input returns an `Error` with its offset; the reader
-never panics on input. `Reader::skip` discards one complete value, nested at
-most `MAX_SKIP_DEPTH` deep.
+Malformed or truncated input returns an `Error` with its byte offset; the
+reader never panics on input. `Reader::skip` discards one complete value,
+nested at most `MAX_SKIP_DEPTH` deep.
 
 ## Writing
 

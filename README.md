@@ -7,29 +7,26 @@
 ![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)
 [![MIT license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[Hessian 2.0](http://hessian.caucho.com/doc/hessian-serialization.html)
-serialization for Python, implemented in Rust.
+Fast [Hessian 2.0](http://hessian.caucho.com/doc/hessian-serialization.html)
+serialization for Python, powered by Rust. Exchange Python objects with
+Java and Go applications without converting nested data to dictionaries first.
 
-- **Python objects, not just dictionaries.** Register dataclasses, attrs classes,
-  named tuples, and enums; adapt other types with a Converter.
-- **Nested values and shared references.** Encode an object graph and recover
-  its registered types and shared objects on decode.
-- **Java-compatible mappings.** Exchange collections, dates, decimals, UUIDs,
-  and registered objects with Java and Go Hessian peers.
-
-On the [large-text benchmarks below](#performance), hessian2 encodes at
-**1.7–12.3×** and decodes at **1.5–18.0×** the speed of Java Caucho Hessian.
-These results measure roughly 1 MB strings, not small messages or object graphs.
-
-Requires CPython 3.11+ with no runtime dependencies. The independent
-[Rust core](crates/hessian2-core/README.md) has no dependencies; both crates
-forbid unsafe code.
+- **Fast.** Encode large strings at **1.7–12.3×** and decode them at
+  **1.5–18.0×** the speed of Java Caucho Hessian in the
+  [text benchmarks](#performance).
+- **Python objects.** Round-trip dataclasses, attrs classes, named tuples,
+  and enums. Use a Converter for Pydantic models and other custom types.
+- **Shared references.** Preserve object identity across nested objects and
+  collections, including cycles in lists, dictionaries, and dataclass/attrs
+  instances.
+- **Built-in Java mappings.** Send decimals, UUIDs, dates, durations, and
+  large integers without writing conversion callbacks.
 
 > Alpha: APIs may change before a stable release.
 
 ## Installation
 
-Requires CPython 3.11+. Install with pip:
+Requires CPython 3.11+ and has no runtime dependencies. Install with pip:
 
 ```console
 python -m pip install hessian2
@@ -147,16 +144,16 @@ print(header, first["status"], first is second)  # header ready True
 
 ## Performance
 
-The primary comparison is **Java Caucho Hessian**, the reference implementation.
-Across four roughly 1 MB text samples, hessian2's encoding speed is
-**1.7–12.3× Caucho's**, and decoding speed is **1.5–18.0× Caucho's**.
+The following measurements compare hessian2 with **Caucho Hessian 4.0.66**,
+the Java reference implementation, on four roughly 1 MB text samples. Encoding
+is **1.7–12.3×** and decoding **1.5–18.0×** as fast in these samples.
 
 ### Encoding
 
-Each row measures one complete `dumps` call. Lower times are better;
-the last column is Caucho's time divided by hessian2's time.
+Times are per complete encoding call, in microseconds (µs); lower is better.
+Speedup is Caucho's time divided by hessian2's time.
 
-| Text | hessian2 | Java Caucho | hessian2 speed relative to Caucho |
+| Text | hessian2 | Java Caucho | Speedup |
 |---|---:|---:|---:|
 | ASCII | 71 µs | 869 µs | **12.3×** |
 | Chinese | 162 µs | 476 µs | **2.9×** |
@@ -165,18 +162,18 @@ the last column is Caucho's time divided by hessian2's time.
 
 ### Decoding
 
-Each row measures one complete `loads` call on the **same Hessian bytes**
-for both implementations.
+Times are per complete decoding call. Both implementations read the
+**same Hessian bytes**; speedup uses the same calculation as above.
 
-| Text | hessian2 | Java Caucho | hessian2 speed relative to Caucho |
+| Text | hessian2 | Java Caucho | Speedup |
 |---|---:|---:|---:|
 | ASCII | 110 µs | 1,990 µs | **18.0×** |
 | Chinese | 552 µs | 1,452 µs | **2.6×** |
 | Mixed | 1,089 µs | 1,611 µs | **1.5×** |
 | Emoji | 900 µs | 1,761 µs | **2.0×** |
 
-These results cover large strings, **not** small messages, registered objects,
-or every platform. They do not establish a general ranking of the languages.
+For small messages and object workloads, benchmark representative application
+data; the text results above do not predict their performance.
 
 <details>
 <summary>hessian-lite and Go results</summary>
@@ -232,8 +229,9 @@ references, use `benchmarks/bench_paths.py` for regression measurements.
 <details>
 <summary>Comparing with other Python formats</summary>
 
-`pickle`, MessagePack, and JSON do not emit Hessian bytes. Compare them when
-choosing a format, not when choosing an implementation for a Hessian peer.
+For Python-only applications, `benchmarks/bench.py` compares hessian2 with
+pickle, MessagePack, and JSON on the same source values. The formats preserve
+different types and references, so choose one that fits your application.
 
 ```console
 uv run --locked --group bench python benchmarks/bench.py --fast -o target/formats.json
@@ -242,8 +240,8 @@ uv run --locked --group bench python benchmarks/bench.py --fast -o target/format
 The `users` workload contains dataclasses. hessian2 and pickle reconstruct
 those classes; msgpack calls `dataclasses.asdict` during encoding, orjson
 encodes dataclasses natively, and both return dictionaries. Decimal/UUID
-conversion and binary representation also differ. These measurements
-compare application costs, not interchangeable formats.
+conversion and binary representation also differ. Include any conversions
+your application needs when interpreting the results.
 
 </details>
 
@@ -432,9 +430,8 @@ message size in the application. See [SECURITY.md](SECURITY.md).
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
 
-The Rust reader and writer are a separate crate,
-[`hessian2-core`](crates/hessian2-core/README.md), with its own README
-and API. Python object mapping belongs to this package, not the Rust core.
+[`hessian2-core`](crates/hessian2-core/README.md) provides the Rust reader
+and writer, with a separate README and API. Both crates forbid unsafe code.
 
 ## License
 

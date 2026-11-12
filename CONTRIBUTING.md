@@ -69,8 +69,12 @@ a bug, and distinguish peer differences from bugs in this library.
 - Add regression tests for behavior changes, including failure paths.
 - Do not commit build output, downloaded jars, environments, or raw benchmark
   files containing machine paths and host metadata.
+- PRs are squash-merged: the PR title and description become the commit
+  message on `main`, so keep both current.
 
 README examples run in `test_readme.py`; Rust README examples run as doctests.
+The Pydantic example needs the `readme` dependency group and is skipped
+without it; CI runs it in one job.
 
 The **Coverage** workflow uploads separate `python` and `rust` reports to
 Codecov using GitHub OIDC, without a stored upload token. It also keeps HTML
@@ -81,12 +85,8 @@ or Go; live-peer tests are optional here, and the separate interoperability
 job validates them. Fixture-based tests still run. The locked test dependencies
 include `tzdata`, so timezone tests also run without a system IANA database.
 
-Before the first Codecov upload, the repository owner must sign in to
-[Codecov](https://app.codecov.io/gh/cnzakii/hessian2), authorize the
-[Codecov GitHub App](https://github.com/apps/codecov) for this repository,
-and complete repository setup. OIDC authenticates uploads; it does not replace
-repository setup. An upload rejected with `Repository not found` requires
-checking that setup and repository access, not disabling upload errors.
+Codecov repository access is managed through the
+[Codecov GitHub App](https://github.com/apps/codecov).
 
 Reproduce the reports locally:
 
@@ -138,15 +138,14 @@ root Cargo.toml, but have separate package artifacts and READMEs. The binding
 crate is not published. During 0.x, use a minor version for breaking public
 API changes and a patch version for compatible fixes.
 
-Before the first release, configure package-index owners and release
-approvals. The canonical repository is
-[cnzakii/hessian2](https://github.com/cnzakii/hessian2); use its
-[private vulnerability reporting](https://github.com/cnzakii/hessian2/security/advisories/new)
-for security reports.
+Confirm package-index ownership and release approval before publishing.
 
 Prepare a release in a focused PR:
 
-1. Update the workspace version, Cargo.lock, and CHANGELOG.md.
+1. Set the workspace version, update lockfiles if needed, and move the
+   `Unreleased` changelog entries under a `## [X.Y.Z] - YYYY-MM-DD` heading.
+   The tag run fails unless that heading exists for the tagged version. Keep
+   an empty `Unreleased` section for subsequent changes.
 2. Run `make check` with Java and Go, inspect regenerated fixture differences,
    and check Rust 1.88 and the supported Python matrix.
 3. Build and test distributions, not just the editable development install:
@@ -155,7 +154,7 @@ Prepare a release in a focused PR:
 uv run --locked maturin build --release --locked --sdist \
   --manifest-path crates/hessian2-python/Cargo.toml --out target/dist
 cargo package -p hessian2-core --locked
-uv run --with twine python -m twine check target/dist/*
+uv run --locked --group release twine check --strict target/dist/*
 ```
 
 `--sdist` builds the wheel from the source archive, checking that its Rust
@@ -164,17 +163,36 @@ clean environments. Check import, version, nested objects, shared references,
 and free-threaded behavior. Per-version wheels are required; this project
 does not use abi3.
 
-The manually dispatched **Distribution builds** workflow builds and tests
-wheels for Python 3.11–3.15 and 3.14t/3.15t on Linux x86-64, macOS arm64, and
-Windows x86-64, plus source and Rust archives. It stores workflow artifacts
-but does **not** publish to package indexes. This starter matrix does not
-promise wheels for every architecture or libc.
+The **Release** workflow (`.github/workflows/release.yml`) runs on
+release-related PRs, manual dispatch, and `v*` tags. It builds a wheel for
+each supported CPython on glibc Linux, musl Linux, macOS, and Windows, for
+x86-64 and ARM64; its matrix is the authoritative list. Each wheel is
+installed and tested in a clean environment, Linux wheels inside the matching
+libc container, and the source archive is installed and tested separately.
+A final job checks the complete artifact set before anything is published.
+PR and manual runs never publish.
 
-Publishing requires separate maintainer approval and package-index setup.
-Publish the tested artifacts, tag their exact source commit, and create
-release notes from the changelog. If publication partially succeeds, keep
-the original artifacts and retry only the failed step. Never replace an
-uploaded file or rewrite a released tag; use a new version for bad artifacts.
+One-time setup before the first tag:
+
+- Create a protected GitHub environment named `release`, restricted to
+  version tags.
+- Add a PyPI pending Trusted Publisher for owner `cnzakii`, repository
+  `hessian2`, workflow `release.yml`, environment `release`.
+- crates.io accepts Trusted Publishing only once a crate's first version
+  exists. Publish `hessian2-core` 0.1.0 by hand from the tagged commit with
+  `cargo publish -p hessian2-core --locked`, then configure Trusted Publishing
+  for the same repository, workflow, and environment. The workflow skips its
+  crates.io job for `v0.1.0`.
+
+For each release, merge the release PR, then push a tag such as `v0.1.0` and
+approve the `release` deployment. The tag must match the workspace version
+and point to a commit on `main`. The tag run builds and validates its own
+artifacts, publishes that Python artifact set without rebuilding it, and
+publishes the Rust crate from the same commit.
+
+If publication partially succeeds, rerun only the failed jobs using the
+original artifacts. Never replace an uploaded file or rewrite a released tag;
+use a new version for bad artifacts.
 
 ## License
 
