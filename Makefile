@@ -19,7 +19,7 @@ test-python:
 	uv run --locked pytest
 
 # Java interoperability: Caucho's reference implementation and hessian-lite.
-# Set JAVA_HOME to a JDK 17+; tests that need it skip when the harness is absent.
+# Set JAVA_HOME to a JDK 17+; live peers run only in the opt-in test targets.
 JAVA_BIN := $(if $(JAVA_HOME),$(JAVA_HOME)/bin/,)
 JAVA_DIR := interop/java
 MAVEN := https://repo1.maven.org/maven2
@@ -47,3 +47,13 @@ fixtures-java: interop-java
 # Go interoperability: dubbo-go-hessian2, pinned in interop/go/go.mod.
 fixtures-go:
 	cd interop/go && go run . write ../../crates/hessian2-python/tests/fixtures/go.json
+
+.PHONY: test-python-live-java test-python-live-go
+
+test-python-live-java: interop-java
+	uv --directory crates/hessian2-python run --locked maturin develop --release
+	HESSIAN2_LIVE_JAVA=1 uv run --locked pytest crates/hessian2-python/tests/test_java_interop.py
+
+test-python-live-go:
+	uv --directory crates/hessian2-python run --locked maturin develop --release
+	HESSIAN2_LIVE_GO=1 uv run --locked pytest crates/hessian2-python/tests/test_go_interop.py

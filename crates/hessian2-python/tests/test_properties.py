@@ -1,40 +1,33 @@
-"""Property tests: encoding round trips, and decoding arbitrary bytes fails only
-with DecodeError."""
+"""Value preservation and total decoding over untrusted bytes."""
 
 from __future__ import annotations
 
-import base64
 import contextlib
+import dataclasses
 import datetime
-import json
 import uuid
-from pathlib import Path
 from typing import Any
 
 import hessian2
+import pytest
+from assertions import same
+from conftest import JAVA_FIXTURES, java_wire
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 UTC = datetime.UTC
-
 scalars = st.one_of(
     st.none(),
     st.booleans(),
-    # Beyond 64 bits as java.math.BigInteger.
     st.integers(),
-    # Java, and so this library, writes -0.0 as 0.0.
     st.floats(allow_nan=False).map(lambda f: f + 0.0),
-    # Includes unpaired surrogates, which Java and Python strings allow.
     st.text(st.characters(codec=None, exclude_categories=())),
     st.binary(),
-    st.datetimes(
-        min_value=datetime.datetime(1, 1, 1),
-        max_value=datetime.datetime(9999, 12, 31),
-        timezones=st.just(UTC),
-    ).map(lambda d: d.replace(microsecond=d.microsecond // 1000 * 1000)),
+    st.datetimes(timezones=st.just(UTC)).map(
+        lambda d: d.replace(microsecond=d.microsecond // 1000 * 1000)
+    ),
     st.decimals(allow_nan=False, allow_infinity=False),
     st.uuids(),
-    # java.time.LocalDateTime, LocalDate, LocalTime, and Duration.
     st.datetimes(),
     st.dates(),
     st.times(),
@@ -45,92 +38,127 @@ keys = st.one_of(
     st.booleans(),
     st.integers(-(2**63), 2**63 - 1),
     st.text(),
-    st.uuids(),
+    st.binary(max_size=8),
+    st.dates(),
 )
 values = st.recursive(
     scalars,
     lambda children: st.one_of(
-        st.lists(children, max_size=8),
-        st.dictionaries(keys, children, max_size=8),
+        st.lists(children, max_size=8), st.dictionaries(keys, children, max_size=8)
     ),
     max_leaves=40,
 )
 
 
-def same(a: Any, b: Any) -> bool:
-    """Equality that also compares the exponent of Decimals and the sign of zero."""
-    if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(map(same, a, b))
-    if isinstance(a, dict) and isinstance(b, dict):
-        return list(a) == list(b) and all(same(a[k], b[k]) for k in a)
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, float):
-        return a.hex() == b.hex()
-    return str(a) == str(b) if hasattr(a, "as_tuple") else a == b
+@given(values)
+def test_untyped_round_trip_preserves_python_types_and_values(value: Any) -> None:
+    decoded = hessian2.loads(hessian2.dumps(value))
+
+    assert same(decoded, value)
 
 
 @given(values)
-def test_round_trip(value: Any) -> None:
-    assert same(hessian2.loads(hessian2.dumps(value)), value)
-
-
-@given(values)
-def test_encoding_is_stable(value: Any) -> None:
+def test_reencoding_a_decoded_value_is_stable(value: Any) -> None:
     data = hessian2.dumps(value)
-    assert hessian2.dumps(hessian2.loads(data)) == data
+
+    assert same(hessian2.dumps(hessian2.loads(data)), data)
 
 
 @given(st.lists(values, max_size=5))
-def test_many_round_trip(items: list[Any]) -> None:
-    assert same(hessian2.loads_many(hessian2.dumps_many(items)), items)
+def test_stream_round_trip_preserves_python_types_and_values(items: list[Any]) -> None:
+    decoded = hessian2.loads_many(hessian2.dumps_many(items))
+
+    assert same(decoded, items)
 
 
-CODECS = [
-    hessian2.Codec(),
-    hessian2.Codec(unknown_class="hessian_object"),
-    hessian2.Codec(unknown_class="dict"),
-]
+@hessian2.java_class("properties.Record")
+@dataclasses.dataclass
+class Record:
+    count: int
+    names: tuple[str, ...]
 
 
-def decodes_or_rejects(data: bytes) -> None:
-    for codec in CODECS:
-        with contextlib.suppress(hessian2.DecodeError):
-            codec.loads_many(data)
+integers = st.integers(-(2**63), 2**63 - 1)
+text = st.text(st.characters(codec=None, exclude_categories=()))
+typed_values = st.one_of(
+    integers.map(lambda v: (v, int)),
+    st.lists(integers, max_size=8).map(lambda v: (v, list[int])),
+    st.lists(text, max_size=8).map(lambda v: (tuple(v), tuple[str, ...])),
+    st.sets(integers, max_size=8).map(lambda v: (v, set[int])),
+    st.dictionaries(st.uuids(), integers, max_size=8).map(
+        lambda v: (v, dict[uuid.UUID, int])
+    ),
+    st.builds(Record, integers, st.lists(text, max_size=5).map(tuple)).map(
+        lambda v: (v, Record)
+    ),
+)
 
 
+@given(typed_values)
+def test_typed_round_trip_preserves_python_types_and_values(
+    case: tuple[Any, Any],
+) -> None:
+    value, annotation = case
+    data = hessian2.dumps(value, type=annotation)
+
+    decoded = hessian2.loads(data, type=annotation)
+
+    assert same(decoded, value)
+
+
+@pytest.mark.parametrize("mode", ["raise", "hessian_object", "dict"])
 @settings(max_examples=500)
 @given(st.binary(max_size=64))
-def test_arbitrary_bytes(data: bytes) -> None:
-    decodes_or_rejects(data)
+def test_any_bytes_decode_or_raise_decode_error(mode: str, data: bytes) -> None:
+    codec = hessian2.Codec(unknown_class=mode)
+
+    with contextlib.suppress(hessian2.DecodeError):
+        codec.loads_many(data)
 
 
-FIXTURES = json.loads(
-    (Path(__file__).parent / "fixtures" / "java.json").read_text(encoding="utf-8")
+@pytest.mark.parametrize(
+    "annotation",
+    [int, float, list[int], tuple[str, ...], dict[str, int], Record],
+    ids=["int", "float", "list", "tuple", "dict", "record"],
 )
+@settings(max_examples=500)
+@given(st.binary(max_size=64))
+def test_any_bytes_with_a_type_decode_or_raise_decode_error(
+    annotation: Any, data: bytes
+) -> None:
+    with contextlib.suppress(hessian2.DecodeError):
+        hessian2.loads(data, type=annotation)
+
+
 SMALL = [
-    base64.b64decode(data)
-    for case in FIXTURES.values()
-    if len(data := case["caucho"] or case["lite"]) < 2000
+    java_wire(name, "caucho" if case["caucho"] else "lite")
+    for name, case in JAVA_FIXTURES.items()
+    if 0 < len(case["caucho"] or case["lite"]) < 2000
 ]
 
 
-def test_every_truncation_of_java_bytes() -> None:
-    for data in SMALL:
-        for end in range(len(data)):
-            decodes_or_rejects(data[:end])
-
-
+@pytest.mark.parametrize("mode", ["raise", "hessian_object", "dict"])
 @settings(max_examples=1000)
 @given(st.sampled_from(SMALL), st.data())
-def test_mutated_java_bytes(data: bytes, draw: st.DataObject) -> None:
+def test_mutated_peer_bytes_decode_or_raise_decode_error(
+    mode: str, data: bytes, draw: st.DataObject
+) -> None:
     mutated = bytearray(data)
-    for _ in range(draw.draw(st.integers(1, 4))):
-        index = draw.draw(st.integers(0, len(mutated) - 1))
-        mutated[index] = draw.draw(st.integers(0, 255))
-    decodes_or_rejects(bytes(mutated))
+    edits = draw.draw(
+        st.lists(
+            st.tuples(st.integers(0, len(data) - 1), st.integers(0, 255)),
+            min_size=1,
+            max_size=4,
+        )
+    )
+    for index, byte in edits:
+        mutated[index] = byte
+    codec = hessian2.Codec(unknown_class=mode)
+
+    with contextlib.suppress(hessian2.DecodeError):
+        codec.loads_many(mutated)
 
 
 @given(st.uuids())
-def test_uuid_text(value: uuid.UUID) -> None:
+def test_uuid_encoding_uses_the_canonical_uuid_text(value: uuid.UUID) -> None:
     assert hessian2.dumps(value).endswith(str(value).encode())

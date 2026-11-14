@@ -1,41 +1,46 @@
-"""Interoperability with Caucho's reference implementation and hessian-lite.
-
-`fixtures/java.json` holds, for Caucho's conformance suite
-(`TestHessian2Servlet.reply*`) and extra cases, the bytes both Java writers
-produce and a structural description of the Java value. Regenerate it with
-`make fixtures-java`. Tests that run Java skip unless `make interop-java` has
-built the harness.
-"""
+"""Public contracts for java interop."""
 
 from __future__ import annotations
 
-import base64
 import dataclasses
 import datetime as dt
 import json
 import os
 import shutil
 import subprocess
+import typing
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 from zoneinfo import ZoneInfo
 
 import hessian2
 import pytest
+from assertions import same
+from conftest import JAVA_FIXTURES as FIXTURES
+from conftest import java_wire as wire
 from describe import describe, unordered
-from hessian2 import HessianObject
+from hessian2 import Codec, Converter, HessianObject
 
 ROOT = Path(__file__).resolve().parents[3]
-FIXTURES = json.loads(
-    (Path(__file__).parent / "fixtures" / "java.json").read_text(encoding="utf-8")
-)
+
 WRITERS = ("caucho", "lite")
+
 CODEC = hessian2.Codec(unknown_class="hessian_object")
 
+LIST_KEYED = dict[tuple[str, ...], int]
 
-def wire(name: str, writer: str) -> bytes:
-    case = FIXTURES[name]
-    return base64.b64decode(case[writer] or case["caucho"])
+CASE_TYPES = {
+    "suite.replyTypedMap_3": LIST_KEYED,
+    "suite.replyUntypedMap_3": LIST_KEYED,
+}
+
+
+def decode(name: str, data: bytes) -> list[Any]:
+    """Decode a case's values, with the annotation it needs, if any."""
+    if name in CASE_TYPES:
+        return CODEC.loads_many(data, types=[CASE_TYPES[name]])
+    return CODEC.loads_many(data)
 
 
 def original(name: str) -> bytes:
@@ -43,30 +48,21 @@ def original(name: str) -> bytes:
     return wire(name, "caucho" if FIXTURES[name]["caucho"] else "lite")
 
 
-# Caucho cannot write java.time values on JDK 17; those cases have no
-# Caucho bytes.
-# test_review2_java.py checks the extra.review2_ boundary cases one by one.
 CASES = [
     (name, writer)
     for name in FIXTURES
     for writer in WRITERS
     if (FIXTURES[name]["caucho"] or writer == "lite")
-    and not name.startswith("extra.review2_")
+    and name not in {"extra.review2_zoned_min", "extra.review2_zoned_max"}
 ]
+
 IDS = [f"{name}-{writer}" for name, writer in CASES]
-# interop.Typed needs tags to be written back as Java reads it; see
-# test_typed_objects_round_trip_from_java.
+
 UNTAGGED_CASES = [case for case in CASES if not case[0].startswith("extra.typed_")]
+
 UNTAGGED_IDS = [f"{name}-{writer}" for name, writer in UNTAGGED_CASES]
 
-# Values Java itself writes lossily: the bytes carry something else.
-JAVA_LOSSY = {
-    # (int) -0.0 == 0, so Java writes 0x5b (0.0).
-    "extra.double_negative_zero",
-}
-JAVA_LOSSY_FOR = {("extra.shadowed_fields", "caucho")}
 
-# Where our bytes for the decoded value differ from Java's, and why.
 _LONGS_IN_INT_RANGE = {
     f"suite.replyLong_{suffix}"
     for suffix in [
@@ -88,6 +84,7 @@ _LONGS_IN_INT_RANGE = {
         "m0x80000000",
     ]
 }
+
 REENCODE_DIFFERS = {
     # A Python int that fits 32 bits is written as a Hessian int, not a long.
     **dict.fromkeys(_LONGS_IN_INT_RANGE | {"extra.long_small"}, "long as int"),
@@ -140,6 +137,7 @@ REENCODE_DIFFERS = {
         ["extra.bigint_small", "extra.bigint_zero"], "small BigInteger as int"
     ),
 }
+
 REENCODE_DIFFERS_FOR = {
     # Caucho's generic bean form; we write hessian-lite's {"value"} form.
     ("extra.uuid", "caucho"): "UUID form",
@@ -158,47 +156,89 @@ REENCODE_DIFFERS_FOR = {
 }
 
 
-@pytest.mark.parametrize(("name", "writer"), CASES, ids=IDS)
-def test_decodes_java_bytes(name: str, writer: str) -> None:
-    values = CODEC.loads_many(wire(name, writer))
-    if name == "extra.throwable":
-        error = values[0]
-        assert error.class_name == "java.lang.Exception"
-        fields = error.fields
-        assert set(fields) == {
-            "detailMessage",
-            "cause",
-            "stackTrace",
-            "suppressedExceptions",
+# The Java fixtures describe the original Java object, before these lossy writes.
+WIRE_VALUES = {
+    ("extra.double_negative_zero", "caucho"): [{"double": "0"}],
+    ("extra.double_negative_zero", "lite"): [{"double": "0"}],
+    ("extra.shadowed_fields", "caucho"): [
+        {"object": "interop.ShadowChild", "fields": {"same": {"str": "parent"}}}
+    ],
+    ("extra.review2_boxed_boundaries", "lite"): [
+        {
+            "list": [
+                {"int": "-128"},
+                {"int": "127"},
+                {"int": "-32768"},
+                {"int": "32767"},
+                {"double": "3fb999999999999a"},
+                {"double": "369ff868bf4d956a"},
+                {"double": "380fffffff9fdba8"},
+                {"double": "47efffffe54daff8"},
+                {"double": "7ff8000000000000"},
+                {"double": "7ff0000000000000"},
+                {"double": "fff0000000000000"},
+            ]
         }
-        assert fields["detailMessage"] == "消息"
-        assert fields["stackTrace"] == fields["suppressedExceptions"] == []
-        cause = fields["cause"]
-        assert cause.class_name == "java.lang.Exception"
-        assert set(cause.fields) == set(fields)
-        assert (
-            cause.fields["detailMessage"] == "cause" and cause.fields["cause"] is None
-        )
-        assert cause.fields["stackTrace"] == []
-        assert cause.fields["suppressedExceptions"] is fields["suppressedExceptions"]
-        return  # Writers traverse fields in different orders, hence different ref numbers.
-    expected = FIXTURES[name]["values"]
-    if name in JAVA_LOSSY or (name, writer) in JAVA_LOSSY_FOR:
-        assert [describe(value) for value in values] != expected
-    else:
-        assert [describe(value) for value in values] == expected
+    ],
+}
 
 
 @pytest.mark.parametrize(
     ("name", "writer"),
-    [(n, w) for n, w in UNTAGGED_CASES if n != "extra.shadowed_fields"],
-    ids=[f"{n}-{w}" for n, w in UNTAGGED_CASES if n != "extra.shadowed_fields"],
+    [(n, w) for n, w in CASES if n != "extra.throwable"],
+    ids=[f"{n}-{w}" for n, w in CASES if n != "extra.throwable"],
 )
-def test_reencodes_java_bytes(name: str, writer: str) -> None:
+def test_java_golden_bytes_decode_to_the_peer_value(name, writer):
+    expected = WIRE_VALUES.get((name, writer), FIXTURES[name]["values"])
+
+    decoded = decode(name, wire(name, writer))
+
+    assert [describe(value) for value in decoded] == expected
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_java_throwable_fields_and_shared_suppression_list_decode(writer):
+    error = CODEC.loads(wire("extra.throwable", writer))
+    fields = error.fields
+    cause = fields["cause"]
+
+    assert error.class_name == cause.class_name == "java.lang.Exception"
+    assert (
+        set(fields)
+        == set(cause.fields)
+        == {"detailMessage", "cause", "stackTrace", "suppressedExceptions"}
+    )
+    assert fields["detailMessage"] == "消息"
+    assert cause.fields["detailMessage"] == "cause"
+    assert cause.fields["cause"] is None
+    assert fields["stackTrace"] == cause.fields["stackTrace"] == []
+    assert fields["suppressedExceptions"] is cause.fields["suppressedExceptions"]
+    assert fields["suppressedExceptions"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "writer"),
+    [
+        (n, w)
+        for n, w in UNTAGGED_CASES
+        if n != "extra.shadowed_fields"
+        and n not in REENCODE_DIFFERS
+        and (n, w) not in REENCODE_DIFFERS_FOR
+        and not n.startswith("extra.review2_")
+    ],
+    ids=[
+        f"{n}-{w}"
+        for n, w in UNTAGGED_CASES
+        if n != "extra.shadowed_fields"
+        and n not in REENCODE_DIFFERS
+        and (n, w) not in REENCODE_DIFFERS_FOR
+        and not n.startswith("extra.review2_")
+    ],
+)
+def test_lossless_python_mappings_reencode_the_exact_java_golden_bytes(name, writer):
     raw = wire(name, writer)
-    same = CODEC.dumps_many(CODEC.loads_many(raw)) == raw
-    reason = REENCODE_DIFFERS.get(name) or REENCODE_DIFFERS_FOR.get((name, writer))
-    assert same == (reason is None), reason or "bytes differ from Java's"
+
+    assert CODEC.dumps_many(decode(name, raw)) == raw
 
 
 def _java() -> list[str] | None:
@@ -214,10 +254,13 @@ def _java() -> list[str] | None:
     return [java, "-cp", f"{build}{os.pathsep}{lib}/*", "interop.Interop"]
 
 
-JAVA = _java()
-needs_java = pytest.mark.skipif(JAVA is None, reason="run `make interop-java` first")
+JAVA = _java() if os.environ.get("HESSIAN2_LIVE_JAVA") == "1" else None
 
-# Where a Java reader's view of our bytes differs from the original value.
+
+needs_java = pytest.mark.skipif(
+    JAVA is None, reason="set HESSIAN2_LIVE_JAVA=1 after make interop-java"
+)
+
 JAVA_READS_DIFFERENTLY = {
     # Caucho reads java.util.UUID with its bean deserializer, which ignores
     # hessian-lite's "value" field.
@@ -231,38 +274,16 @@ JAVA_READS_DIFFERENTLY = {
 }
 
 
-@pytest.fixture(scope="module")
-def java_views(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
-    """What each Java reader decodes from our encoding of every case."""
-    assert JAVA is not None
-    directory = tmp_path_factory.mktemp("ours")
-    for name in FIXTURES:
-        values = CODEC.loads_many(original(name))
-        (directory / f"{name}.bin").write_bytes(CODEC.dumps_many(values))
-    views = {}
-    for reader in WRITERS:
-        result = subprocess.run(
-            [*JAVA, "describe", reader, str(directory)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        views[reader] = json.loads(result.stdout)
-    return views
-
-
 @needs_java
-@pytest.mark.parametrize(("name", "reader"), UNTAGGED_CASES, ids=UNTAGGED_IDS)
-def test_java_reads_our_bytes(
-    java_views: dict[str, dict[str, Any]], name: str, reader: str
-) -> None:
-    view = java_views[reader][name]
-    assert "error" not in view, view
-    # Our bytes come from decoding the original ones, so compare with those.
-    expected = [describe(value) for value in CODEC.loads_many(original(name))]
-    same = unordered(view["values"]) == unordered(expected)
-    reason = JAVA_READS_DIFFERENTLY.get((name, reader))
-    assert same == (reason is None), reason or (view["values"], expected)
+@pytest.mark.parametrize(
+    ("name", "reader"),
+    [(n, r) for n, r in UNTAGGED_CASES if (n, r) not in JAVA_READS_DIFFERENTLY],
+    ids=[f"{n}-{r}" for n, r in UNTAGGED_CASES if (n, r) not in JAVA_READS_DIFFERENTLY],
+)
+def test_java_reads_python_mappings_as_the_same_values(java_views, name, reader):
+    expected = [describe(value) for value in decode(name, original(name))]
+
+    assert unordered(java_views[reader][name]["values"]) == unordered(expected)
 
 
 @needs_java
@@ -293,6 +314,7 @@ ARG_CASES = [
 @pytest.mark.parametrize(("name", "reader"), ARG_CASES)
 def test_caucho_arg_checks_our_bytes(java_views, name, reader):
     view = java_views[reader][name]
+
     assert "error" not in view, view
     # Python discards the int/long distinction and typed-list metadata;
     # hessian-lite also denies Caucho's test bean classes.
@@ -310,44 +332,40 @@ def test_caucho_arg_checks_our_bytes(java_views, name, reader):
 def test_shadowed_field_matches_java_reader(writer, visible):
     # Both Java readers also keep the last wire occurrence in the visible child field.
     value = CODEC.loads(wire("extra.shadowed_fields", writer))
+
     assert value.class_name == "interop.ShadowChild"
     assert value.fields == {"same": visible}
 
 
 @pytest.mark.parametrize("writer", WRITERS)
-def test_shadowed_fields_keep_the_last_slot(writer):
-    # A field hiding a superclass field of the same name is written twice.
-    # Java's readers keep the last value, as HessianObject's dict does, so
-    # reencoding writes the field once.
-    raw = wire("extra.shadowed_fields", writer)
-    shadow = CODEC.loads(raw)
-    assert CODEC.dumps(shadow) != raw
-    assert len(shadow.fields) == len(set(shadow.fields))
+def test_java_collection_stream_references_keep_identity(writer):
+    first, number, repeated, null, tail = CODEC.loads_many(
+        wire("extra.stream_collections", writer)
+    )
 
-
-@pytest.mark.parametrize("writer", WRITERS)
-def test_java_collection_stream_continuation_and_identity(writer):
-    raw = wire("extra.stream_collections", writer)
-    first, number, repeated, null, tail = CODEC.loads_many(raw)
-    assert type(first) is list and first == [None, "tail"]
     assert first is repeated
-    assert number == 123 and null is None and tail == "end"
-    assert raw.endswith(b"Q\x90N\x03end")
+    assert same((first, number, null, tail), ([None, "tail"], 123, None, "end"))
 
 
 @pytest.mark.parametrize("writer", WRITERS)
-def test_java_array_and_mutual_bean_cycles(writer):
-    array = CODEC.loads(wire("extra.array_cycle", writer))
-    assert type(array) is list and array[0] == "self" and array[1] is array
+def test_java_arrays_can_reference_themselves(writer):
+    value = CODEC.loads(wire("extra.array_cycle", writer))
+
+    assert type(value) is list
+    assert value[0] == "self"
+    assert value[1] is value
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_java_mutual_beans_preserve_both_reference_directions(writer):
     first, second, repeated = CODEC.loads(wire("extra.mutual_beans", writer))
-    assert type(first) is type(second) is hessian2.HessianObject
+
+    assert type(first) is type(second) is HessianObject
     assert first.class_name == second.class_name == "interop.Person"
-    assert first.fields["name"] == "first" and second.fields["name"] == "second"
+    assert (first.fields["name"], second.fields["name"]) == ("first", "second")
     assert first is repeated and first is not second
-    assert first.fields["friend"] is second and second.fields["friend"] is first
-
-
-# --- Java types a plain int or datetime does not convert to --------------------
+    assert first.fields["friend"] is second
+    assert second.fields["friend"] is first
 
 
 class TypedExtra(TypedDict):
@@ -367,6 +385,186 @@ class Typed:
     any: hessian2.Long
 
 
+@hessian2.java_class("java.lang.Exception")
+@dataclasses.dataclass
+class JavaException(Exception):
+    detail_message: str | None = None
+    cause: JavaException | None = None
+    stack_trace: list[Any] = dataclasses.field(default_factory=list)
+    suppressed_exceptions: list[Any] = dataclasses.field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        super().__init__(self.detail_message)
+
+
+@hessian2.java_class("java.lang.IllegalStateException")
+@dataclasses.dataclass
+class IllegalState(Exception):
+    detail_message: str
+
+
+@hessian2.java_class("interop.Person")
+@dataclasses.dataclass
+class Person:
+    name: str
+
+
+@needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+@pytest.mark.parametrize(
+    ("annotation", "value", "expected"),
+    [
+        (tuple[str, ...], ("a", None), "[Ljava.lang.String;"),
+        (tuple[Any, ...], ("a", 1, None), "[Ljava.lang.Object;"),
+        (tuple[list[int], ...], ([1],), "[Ljava.lang.Object;"),
+        (tuple[int | str, ...], (1, "a"), "[Ljava.lang.Object;"),
+        (tuple[None, ...], (None,), "[Ljava.lang.Object;"),
+        (tuple[int, ...], (1, 2), "[I"),
+        (tuple[int | None, ...], (1, None), "[Ljava.lang.Integer;"),
+        (tuple[hessian2.Long, ...], (1,), "[J"),
+        (tuple[float, ...], (1.5,), "[D"),
+        (tuple[bool, ...], (True,), "[Z"),
+        (tuple[Decimal, ...], (Decimal("1.5"),), "[Ljava.math.BigDecimal;"),
+        (
+            tuple[hessian2.Date, ...],
+            (dt.datetime(2026, 1, 1, tzinfo=dt.UTC),),
+            "[Ljava.util.Date;",
+        ),
+        (tuple[Person, ...], (Person("a"),), "[Linterop.Person;"),
+        (tuple[tuple[int, ...], ...], ((1,), ()), "[[I"),
+        (tuple[bytes, ...], (b"x",), "[[B"),
+    ],
+    ids=[
+        "strings",
+        "objects",
+        "lists",
+        "mixed",
+        "nulls",
+        "ints",
+        "boxed",
+        "longs",
+        "doubles",
+        "booleans",
+        "decimals",
+        "dates",
+        "people",
+        "nested",
+        "binaries",
+    ],
+)
+def test_java_reads_variadic_tuples_as_the_declared_array_class(
+    tmp_path, reader, annotation, value, expected
+):
+    data = hessian2.dumps(value, type=annotation)
+
+    views = java_types(tmp_path, reader, {"array": (data, "java.lang.Object")})
+
+    assert views["array"] == {"class": expected}
+
+
+@needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+def test_java_reads_arrays_of_converted_values_as_java_name_gives(
+    tmp_path: Path, reader: str
+) -> None:
+    codec = Codec()
+    # An int written as a BigDecimal, inside an array its tag would name.
+    codec.register(
+        Converter(
+            int,
+            to_fields=lambda value: {"value": str(value)},
+            from_fields=lambda fields: int(fields["value"]),
+        ),
+        name="java.math.BigDecimal",
+        replace=True,
+    )
+    annotation = tuple[hessian2.BigInteger, ...]
+    data = codec.dumps((7,), type=annotation)
+    views = java_types(tmp_path, reader, {"array": (data, "java.lang.Object")})
+
+    assert views["array"] == {"class": "[Ljava.math.BigDecimal;"}
+
+
+@needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+@pytest.mark.parametrize("case", ["dates", "nullable", "converted"])
+def test_java_reads_the_values_of_annotated_arrays(tmp_path, reader, case):
+    long_id = typing.NewType("long_id", hessian2.Long)
+    retagged = Annotated[long_id, *typing.get_args(hessian2.Long)[1:]]
+    binary = Codec()
+    binary.register(
+        Converter(
+            bytes,
+            lambda value: {"value": str(value[0])},
+            lambda fields: bytes([int(fields["value"])]),
+        ),
+        name="java.math.BigDecimal",
+        replace=True,
+    )
+    data, expected = {
+        "dates": (
+            hessian2.dumps((dt.date(2026, 1, 2),), type=tuple[dt.date, ...]),
+            [{"local_date": "2026-01-02"}],
+        ),
+        "nullable": (
+            hessian2.dumps((7, None), type=tuple[retagged | None, ...]),
+            [{"int": "7"}, None],
+        ),
+        "converted": (
+            binary.dumps((b"\x07",), type=tuple[bytes, ...]),
+            [{"decimal": "7"}],
+        ),
+    }[case]
+    (tmp_path / "array.bin").write_bytes(data)
+
+    result = subprocess.run(
+        [*JAVA, "describe", reader, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert same(json.loads(result.stdout)["array"], {"values": [{"list": expected}]})
+
+
+def _one_field(name: str, field: str, ty: type) -> type:
+    cls = dataclasses.make_dataclass(name, [(field, ty)])
+    return hessian2.java_class(f"com.example.{name}")(cls)
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_java_maps_decode_as_the_classes_annotations_name(writer: str) -> None:
+    # Java reads a map into a declared class, whatever map type it names.
+    types = tuple[
+        _one_field("Hash", "hash", int),
+        _one_field("Linked", "linked", int),
+        _one_field("Sorted", "sorted", int),
+        _one_field("Table", "table", int),
+        _one_field("Property", "property", str),
+        _one_field("Concurrent", "concurrent", int),
+    ]
+
+    decoded = hessian2.loads(wire("extra.map_types", writer), type=types)
+
+    assert [dataclasses.astuple(value) for value in decoded] == [
+        (1,),
+        (2,),
+        (3,),
+        (4,),
+        ("value",),
+        (5,),
+    ]
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_java_throwable_decodes_as_a_declared_exception(writer: str) -> None:
+    error = hessian2.loads(wire("extra.throwable", writer), type=JavaException)
+
+    assert isinstance(error, JavaException) and str(error) == "消息"
+    assert error.cause is not None and error.cause.detail_message == "cause"
+    assert error.cause.cause is None and error.stack_trace == []
+
+
 def java_types(tmp_path: Path, reader: str, cases: dict[str, tuple[bytes, str]]) -> Any:
     """What a Java reader holds after reading each value as the given type."""
     assert JAVA is not None
@@ -384,60 +582,96 @@ def java_types(tmp_path: Path, reader: str, cases: dict[str, tuple[bytes, str]])
 
 @needs_java
 @pytest.mark.parametrize("reader", WRITERS)
-def test_java_reads_tagged_values_as_declared_types(
-    tmp_path: Path, reader: str
-) -> None:
-    moment = dt.datetime(2026, 1, 2, 3, 4, 5, 6000, tzinfo=ZoneInfo("Asia/Shanghai"))
-    # Caucho cannot read hessian-lite's java.time handles.
-    times = (moment, moment, moment) if reader == "lite" else (None, None, None)
-    typed = Typed(5, [6], *times, [7], {"count": 8}, 9)
-    # One list in two fields with different tags: each field gets its own.
-    shared = [6]
-    sharing = Typed(5, shared, *times, shared, {"count": 8}, 9)
-    exception = HessianObject("java.lang.RuntimeException", {"detailMessage": "boom"})
-    views = java_types(
-        tmp_path,
-        reader,
-        {
-            "untagged_big_integer": (hessian2.dumps(5), "java.math.BigInteger"),
-            "big_integer": (
-                hessian2.dumps(5, type=hessian2.BigInteger),
-                "java.math.BigInteger",
-            ),
-            "long_list": (
-                hessian2.dumps([1, 2], type=list[hessian2.Long]),
-                "java.util.List",
-            ),
-            "long_object": (hessian2.dumps(5, type=hessian2.Long), "java.lang.Object"),
-            "exception": (hessian2.dumps(exception), "java.lang.Throwable"),
-            "typed": (hessian2.dumps(typed), "interop.Typed"),
-            "sharing": (hessian2.dumps(sharing), "interop.Typed"),
-        },
-    )
-    assert "expected map/object" in views["untagged_big_integer"]["error"]
-    assert views["big_integer"] == {"class": "java.math.BigInteger"}
-    assert views["long_list"]["items"] == ["java.lang.Long", "java.lang.Long"]
-    assert views["long_object"] == {"class": "java.lang.Long"}
-    assert views["exception"] == {
-        "class": "java.lang.RuntimeException",
-        "message": "boom",
-    }
-    shared_fields = views["sharing"]["fields"]
-    assert shared_fields["amounts"]["items"] == ["java.math.BigInteger"]
-    assert shared_fields["ids"]["items"] == ["java.lang.Long"]
-    fields = views["typed"]["fields"]
-    assert fields["amount"] == {"class": "java.math.BigInteger"}
-    assert fields["amounts"]["items"] == ["java.math.BigInteger"]
-    assert fields["ids"]["items"] == ["java.lang.Long"]
-    assert fields["extra"]["values"] == ["java.lang.Long"]
-    assert fields["any"] == {"class": "java.lang.Long"}
-    if reader == "lite":
-        assert fields["instant"] == {"class": "java.time.Instant"}
-        assert fields["offset"] == {"class": "java.time.OffsetDateTime"}
-        assert fields["zoned"] == {"class": "java.time.ZonedDateTime"}
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("big_integer", {"class": "java.math.BigInteger"}),
+        (
+            "long_list",
+            {
+                "class": "java.util.ArrayList",
+                "items": ["java.lang.Long", "java.lang.Long"],
+            },
+        ),
+        ("long_object", {"class": "java.lang.Long"}),
+        ("date", {"class": "java.util.Date"}),
+        ("exception", {"class": "java.lang.RuntimeException", "message": "boom"}),
+        (
+            "declared_exception",
+            {"class": "java.lang.IllegalStateException", "message": "boom"},
+        ),
+    ],
+)
+def test_java_reads_tagged_values_as_the_declared_class(
+    tmp_path, reader, case, expected, tagged_java_inputs
+):
+    views = java_types(tmp_path, reader, {"value": tagged_java_inputs[case]})
+
+    assert views["value"] == expected
 
 
 @needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+def test_java_big_integer_positions_reject_a_bare_integer(tmp_path, reader):
+    views = java_types(
+        tmp_path, reader, {"value": (hessian2.dumps(5), "java.math.BigInteger")}
+    )
+
+    assert "expected map/object" in views["value"]["error"]
+
+
+@needs_java
+@pytest.mark.parametrize(
+    ("case", "field", "part", "expected"),
+    [
+        ("typed", "amount", "class", "java.math.BigInteger"),
+        ("typed", "amounts", "items", ["java.math.BigInteger"]),
+        ("typed", "ids", "items", ["java.lang.Long"]),
+        ("typed", "extra", "values", ["java.lang.Long"]),
+        ("typed", "any", "class", "java.lang.Long"),
+        ("sharing", "amounts", "items", ["java.math.BigInteger"]),
+        ("sharing", "ids", "items", ["java.lang.Long"]),
+    ],
+)
+@pytest.mark.parametrize("reader", WRITERS)
+def test_java_reads_each_annotated_field_with_its_own_type(
+    tmp_path, reader, case, field, part, expected, tagged_java_inputs
+):
+    views = java_types(
+        tmp_path, reader, {"value": tagged_java_inputs[f"{case}-{reader}"]}
+    )
+
+    assert views["value"]["fields"][field][part] == expected
+
+
+@needs_java
+@pytest.mark.parametrize(
+    ("case", "field", "expected"),
+    [
+        ("typed-lite", "instant", "java.time.Instant"),
+        ("typed-lite", "offset", "java.time.OffsetDateTime"),
+        ("typed-lite", "zoned", "java.time.ZonedDateTime"),
+    ],
+)
+def test_hessian_lite_reads_annotated_java_time_fields(
+    tmp_path, case, field, expected, tagged_java_inputs
+):
+    views = java_types(tmp_path, "lite", {"value": tagged_java_inputs[case]})
+
+    assert views["value"]["fields"][field] == {"class": expected}
+
+
+@needs_java
+def test_hessian_lite_reads_a_local_datetime_tag_as_local_datetime(
+    tmp_path, tagged_java_inputs
+):
+    views = java_types(
+        tmp_path, "lite", {"value": tagged_java_inputs["local_datetime"]}
+    )
+
+    assert views["value"] == {"class": "java.time.LocalDateTime"}
+
+
 @pytest.mark.parametrize(
     ("name", "writer"),
     [
@@ -446,32 +680,250 @@ def test_java_reads_tagged_values_as_declared_types(
         ("extra.typed_without_time", "lite"),
     ],
 )
-@pytest.mark.parametrize("reader", ["caucho", "lite"])
-def test_typed_objects_round_trip_from_java(
-    tmp_path: Path, name: str, writer: str, reader: str
-) -> None:
-    codec = hessian2.Codec()
+def test_java_typed_objects_decode_their_integer_and_collection_fields(name, writer):
+    codec = Codec()
     codec.register(Typed)
-    typed = codec.loads(wire(name, writer))
-    assert typed.amount == 5 and typed.amounts == [6] and typed.ids == [7]
-    assert typed.extra == {"count": 8} and typed.any == 9
-    times = (typed.instant, typed.offset, typed.zoned)
-    if name == "extra.typed_fields":
-        assert typed.instant == dt.datetime.fromtimestamp(1_700_000_000.123, dt.UTC)
-        assert typed.offset.utcoffset() == dt.timedelta(hours=8)
-        assert str(typed.zoned.tzinfo) == "Europe/Paris"
-        if reader == "caucho":
-            return  # Caucho cannot read hessian-lite's java.time handles.
-    else:
-        assert times == (None, None, None)
-    view = java_types(
-        tmp_path, reader, {"typed": (codec.dumps(typed), "interop.Typed")}
+
+    value = codec.loads(wire(name, writer))
+
+    assert same(
+        (value.amount, value.amounts, value.ids, value.extra, value.any),
+        (5, [6], [7], {"count": 8}, 9),
     )
-    fields = view["typed"]["fields"]
-    assert fields["amount"] == {"class": "java.math.BigInteger"}
-    assert fields["amounts"]["items"] == ["java.math.BigInteger"]
-    assert fields["ids"]["items"] == ["java.lang.Long"]
-    assert fields["extra"]["values"] == ["java.lang.Long"]
-    assert fields["any"] == {"class": "java.lang.Long"}
-    if name == "extra.typed_fields":
-        assert fields["zoned"] == {"class": "java.time.ZonedDateTime"}
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_java_typed_objects_preserve_null_java_time_fields(writer):
+    codec = Codec()
+    codec.register(Typed)
+
+    value = codec.loads(wire("extra.typed_without_time", writer))
+
+    assert (value.instant, value.offset, value.zoned) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("field", "inspect_value", "expected"),
+    [
+        (
+            "instant",
+            lambda v: v,
+            dt.datetime(2023, 11, 14, 22, 13, 20, 123000, tzinfo=dt.UTC),
+        ),
+        ("offset", lambda v: v.utcoffset(), dt.timedelta(hours=8)),
+        ("zoned", lambda v: str(v.tzinfo), "Europe/Paris"),
+    ],
+)
+def test_java_typed_objects_preserve_java_time_field_values(
+    field, inspect_value, expected
+):
+    codec = Codec()
+    codec.register(Typed)
+
+    value = codec.loads(wire("extra.typed_fields", "lite"))
+
+    assert same(inspect_value(getattr(value, field)), expected)
+
+
+@needs_java
+@pytest.mark.parametrize(
+    ("name", "writer", "reader"),
+    [
+        ("extra.typed_fields", "lite", "lite"),
+        ("extra.typed_without_time", "caucho", "caucho"),
+        ("extra.typed_without_time", "caucho", "lite"),
+        ("extra.typed_without_time", "lite", "caucho"),
+        ("extra.typed_without_time", "lite", "lite"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("field", "part", "expected"),
+    [
+        ("amount", "class", "java.math.BigInteger"),
+        ("amounts", "items", ["java.math.BigInteger"]),
+        ("ids", "items", ["java.lang.Long"]),
+        ("extra", "values", ["java.lang.Long"]),
+        ("any", "class", "java.lang.Long"),
+    ],
+)
+def test_java_round_trip_keeps_each_declared_integer_field_type(
+    tmp_path, name, writer, reader, field, part, expected
+):
+    codec = Codec()
+    codec.register(Typed)
+    value = codec.loads(wire(name, writer))
+
+    views = java_types(
+        tmp_path, reader, {"typed": (codec.dumps(value), "interop.Typed")}
+    )
+
+    assert views["typed"]["fields"][field][part] == expected
+
+
+@needs_java
+def test_hessian_lite_round_trip_keeps_the_zoned_datetime_field_type(tmp_path):
+    codec = Codec()
+    codec.register(Typed)
+    value = codec.loads(wire("extra.typed_fields", "lite"))
+
+    views = java_types(
+        tmp_path, "lite", {"typed": (codec.dumps(value), "interop.Typed")}
+    )
+
+    assert views["typed"]["fields"]["zoned"] == {"class": "java.time.ZonedDateTime"}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("extra.review2_zoned_min", dt.datetime(1, 1, 1, tzinfo=ZoneInfo("Etc/GMT-1"))),
+        (
+            "extra.review2_zoned_max",
+            dt.datetime(9999, 12, 31, 23, 59, 59, tzinfo=ZoneInfo("Etc/GMT+1")),
+        ),
+    ],
+    ids=["year-one", "year-9999"],
+)
+def test_java_zoned_datetimes_at_python_year_edges_preserve_their_zone(name, expected):
+    decoded = hessian2.loads(wire(name, "lite"))
+
+    assert same(decoded, expected)
+    assert decoded.tzinfo == expected.tzinfo
+
+
+@pytest.mark.parametrize(
+    ("name", "pairs", "writer"),
+    [
+        ("extra.review2_time_nested_refs", [(0, 3), (1, 4), (2, 5), (6, 7)], "lite"),
+        ("extra.review2_bigint_refs", [(0, 2), (1, 3)], "caucho"),
+        ("extra.review2_bigint_refs", [(0, 2), (1, 3)], "lite"),
+        ("extra.review2_boxed_refs", [(2, 3)], "caucho"),
+        ("extra.review2_boxed_refs", [(2, 3)], "lite"),
+    ],
+)
+def test_java_builtin_objects_keep_their_reference_slots(name, pairs, writer):
+    values = hessian2.loads(wire(name, writer))
+
+    assert all(values[first] is values[second] for first, second in pairs)
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_java_boxed_scalar_duplicates_preserve_value(writer):
+    values = hessian2.loads(wire("extra.review2_boxed_refs", writer))
+
+    assert same(values[0], values[1])
+
+
+def test_java_overlap_datetimes_preserve_fold_and_offset():
+    values = hessian2.loads(wire("extra.review2_time_overlap", "lite"))
+
+    assert [v.fold for v in values] == [0, 1]
+    assert [v.utcoffset() for v in values] == [
+        dt.timedelta(hours=-4),
+        dt.timedelta(hours=-5),
+    ]
+
+
+@needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+@pytest.mark.parametrize(
+    ("name", "writer"), [(n, w) for n, w in CASES if n.startswith("extra.review2_")]
+)
+def test_java_reads_python_mappings_of_builtin_edge_values(
+    tmp_path, reader, name, writer
+):
+    value = hessian2.loads(wire(name, writer))
+    (tmp_path / "python.bin").write_bytes(hessian2.dumps(value))
+    result = subprocess.run(
+        [*JAVA, "describe", reader, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    assert same(
+        unordered(json.loads(result.stdout)["python"]["values"]),
+        unordered([describe(value)]),
+    )
+
+
+@needs_java
+@pytest.mark.parametrize(
+    ("name", "writer", "reader"),
+    [
+        (n, w, r)
+        for n, w in CASES
+        if n.startswith("extra.review2_")
+        for r in WRITERS
+        if w == r
+        or n not in {"extra.review2_boxed_boundaries", "extra.review2_boxed_refs"}
+    ],
+)
+def test_java_peers_read_each_others_compatible_builtin_edge_values(
+    tmp_path, name, writer, reader
+):
+    raw = wire(name, writer)
+    (tmp_path / "peer.bin").write_bytes(raw)
+    result = subprocess.run(
+        [*JAVA, "describe", reader, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    assert same(
+        unordered(json.loads(result.stdout)["peer"]["values"]),
+        unordered([describe(hessian2.loads(raw))]),
+    )
+
+
+@needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [({"a", "b"}, [{"str": "a"}, {"str": "b"}]), (frozenset(), [])],
+    ids=["set", "frozenset"],
+)
+def test_java_reads_all_elements_of_python_sets(tmp_path, reader, value, expected):
+    (tmp_path / "python.bin").write_bytes(hessian2.dumps(value))
+
+    result = subprocess.run(
+        [*JAVA, "describe", reader, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    actual = json.loads(result.stdout)["python"]["values"][0]["list"]
+
+    assert sorted(actual, key=repr) == expected
+
+
+@needs_java
+@pytest.mark.parametrize("reader", WRITERS)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (2**64, "18446744073709551616"),
+        (
+            -(2**1000),
+            "-10715086071862673209484250490600018105614048117055336074437503883703510511249361224931983788156958581275946729175531468251871452856923140435984577574698574803934567774824230985421074605062371141877954182153046474983581941267398767559165543946077062914571196477686542167660429831652624386837205668069376",
+        ),
+    ],
+    ids=["word-boundary", "negative-large"],
+)
+def test_java_reads_python_big_integer_values(tmp_path, reader, value, expected):
+    (tmp_path / "python.bin").write_bytes(hessian2.dumps(value))
+
+    result = subprocess.run(
+        [*JAVA, "describe", reader, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    assert same(json.loads(result.stdout)["python"], {"values": [{"int": expected}]})

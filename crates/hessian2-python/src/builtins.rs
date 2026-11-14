@@ -163,6 +163,27 @@ impl Builtin {
         })
     }
 
+    /// Returns the class of the values [`Builtin::build`] returns, so a
+    /// position can be checked before one is built.
+    pub fn decoded_type(self, py: Python<'_>) -> PyResult<Bound<'_, PyType>> {
+        Ok(match self {
+            Self::Decimal => api(py)?.decimal.bind(py).clone(),
+            Self::Uuid => api(py)?.uuid.bind(py).clone(),
+            Self::BigInteger | Self::SmallInt => py.get_type::<pyo3::types::PyInt>(),
+            Self::Float => py.get_type::<pyo3::types::PyFloat>(),
+            Self::LocalDate => py.get_type::<PyDate>(),
+            Self::LocalTime => py.get_type::<PyTime>(),
+            Self::Duration => py.get_type::<PyDelta>(),
+            Self::LocalDateTime | Self::Instant | Self::OffsetDateTime | Self::ZonedDateTime => {
+                py.get_type::<pyo3::types::PyDateTime>()
+            }
+            Self::ZoneOffset => py
+                .import(intern!(py, "datetime"))?
+                .getattr(intern!(py, "timezone"))?
+                .cast_into()?,
+        })
+    }
+
     /// Builds the Python value from the fields named by
     /// [`Builtin::read_fields`], each `None` when the object lacks it.
     ///
@@ -426,6 +447,7 @@ pub struct Api {
     pub object_new: Py<PyAny>,
     pub tuple_new: Py<PyAny>,
     pub object_setattr: Py<PyAny>,
+    pub enum_type: Py<PyType>,
     decimal: Py<PyType>,
     uuid: Py<PyType>,
     uuid_unknown: Py<PyAny>,
@@ -445,6 +467,7 @@ pub fn api(py: Python<'_>) -> PyResult<&Api> {
                 .getattr("__new__")?
                 .unbind(),
             object_setattr: object.getattr("__setattr__")?.unbind(),
+            enum_type: py.import("enum")?.getattr("Enum")?.cast_into()?.unbind(),
             decimal: py
                 .import("decimal")?
                 .getattr("Decimal")?

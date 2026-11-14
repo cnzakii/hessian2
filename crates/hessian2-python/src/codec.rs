@@ -2,7 +2,8 @@
 //! them.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
+use std::sync::{OnceLock, RwLock};
 
 use pyo3::PyTraverseError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -16,8 +17,10 @@ use pyo3::types::{
 use crate::address::AddressMap;
 use crate::builtins::Builtin;
 use crate::decode::Decoder;
-use crate::encode::Encoder;
+use crate::encode::{self, Encoder};
 use crate::hint::{self, Hint};
+use crate::reader::Reader;
+use crate::typed::{self, Type};
 
 /// What decoding does with an object whose class has no registration.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,7 +31,7 @@ pub enum Unknown {
 }
 
 impl Unknown {
-    fn parse(value: &str) -> PyResult<Self> {
+    pub fn parse(value: &str) -> PyResult<Self> {
         match value {
             "raise" => Ok(Self::Raise),
             "hessian_object" => Ok(Self::Object),
@@ -52,6 +55,13 @@ pub struct Field {
     pub default: Default,
     /// How the field's values are written, from its annotation.
     pub hint: Option<Hint>,
+    /// The annotation `hint` comes from, when there is a hint.
+    pub annotation: Option<Py<PyAny>>,
+    /// The annotation with the namespace it was compiled in, when the
+    /// class has one, for compiling it again alike.
+    pub scope: Option<Py<PyAny>>,
+    /// What the field's values decode as, from its annotation.
+    pub ty: Type,
 }
 
 pub enum Kind {
@@ -60,6 +70,9 @@ pub enum Kind {
         fields: Vec<Field>,
         /// Set attributes with `object.__setattr__`, past a frozen class's own.
         bypass_setattr: bool,
+        /// The `__new__` that makes an instance without running the class's
+        /// own code.
+        new: Py<PyAny>,
         /// The method run after the fields are set, and its arguments: the
         /// defaults of a dataclass's `InitVar`s.
         post_init: Option<(Py<PyString>, Py<PyTuple>)>,
@@ -84,9 +97,35 @@ pub struct Entry {
     pub name: String,
     pub ty: Py<PyType>,
     pub kind: Kind,
+    /// [`shape_hash`] of the name and wire fields.
+    pub shape: u64,
+}
+
+/// Returns a hash of a class name and its field names, which identify one
+/// class definition in a stream. Seeded per process, as a `HashMap` is, so
+/// names from a peer cannot be chosen to collide.
+pub fn shape_hash<S: AsRef<str>>(name: &str, fields: &[S]) -> u64 {
+    static STATE: OnceLock<RandomState> = OnceLock::new();
+    let mut hasher = STATE.get_or_init(RandomState::new).build_hasher();
+    name.hash(&mut hasher);
+    for field in fields {
+        field.as_ref().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl Entry {
+    fn new(name: String, ty: Py<PyType>, kind: Kind) -> Self {
+        let mut entry = Self {
+            name,
+            ty,
+            kind,
+            shape: 0,
+        };
+        entry.shape = shape_hash(&entry.name, &entry.wire_fields());
+        entry
+    }
+
     /// Returns what the name maps to, for error messages.
     fn describe(&self, py: Python<'_>) -> PyResult<String> {
         Ok(match self.kind {
@@ -113,8 +152,12 @@ impl Entry {
         visit.call(&self.ty)?;
         match &self.kind {
             Kind::Class {
-                fields, post_init, ..
+                fields,
+                new,
+                post_init,
+                ..
             } => {
+                visit.call(new)?;
                 visit_fields(fields, &visit)?;
                 if let Some((name, args)) = post_init {
                     visit.call(name)?;
@@ -135,6 +178,12 @@ impl Entry {
 fn visit_fields(fields: &[Field], visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
     for field in fields {
         visit.call(&field.attr)?;
+        visit.call(&field.annotation)?;
+        visit.call(&field.scope)?;
+        field.ty.traverse(visit)?;
+        if let Some(hint) = &field.hint {
+            hint.traverse(visit)?;
+        }
         match &field.default {
             Default::Value(value) => visit.call(value)?,
             Default::Factory(factory) => visit.call(factory)?,
@@ -157,6 +206,15 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Returns the name the codec's own registration gives a type, not a
+    /// built-in mapping of a JDK value.
+    pub fn registered_name(&self, ty: &Bound<'_, PyType>) -> Option<&str> {
+        self.by_type
+            .get(&(ty.as_ptr() as usize))
+            .filter(|entry| !matches!(entry.get().kind, Kind::Value(_)))
+            .map(|entry| entry.get().name.as_str())
+    }
+
     fn clone_ref(&self, py: Python<'_>) -> Self {
         Self {
             by_name: self
@@ -319,12 +377,12 @@ impl Codec {
             for (index, name) in builtin.names().iter().enumerate() {
                 let entry = Py::new(
                     py,
-                    Entry {
-                        name: (*name).to_owned(),
+                    Entry::new(
+                        (*name).to_owned(),
                         // Never used as a key for a type that only decodes.
-                        ty: python_type.as_ref().unwrap_or(&object).clone().unbind(),
-                        kind: Kind::Value(builtin),
-                    },
+                        python_type.as_ref().unwrap_or(&object).clone().unbind(),
+                        Kind::Value(builtin),
+                    ),
                 )?;
                 if index == 0
                     && let Some(ty) = &python_type
@@ -448,67 +506,141 @@ impl Codec {
         Ok(PyBytes::new(py, encoder.finish()).unbind())
     }
 
+    /// Return the object ``dumps`` writes ``obj`` as, one level deep.
+    ///
+    /// For an instance of a registered or declared class, a converter's
+    /// type, or an enum, the result has the Java class name and the fields
+    /// ``dumps`` writes, by wire name and in order, without encoding them.
+    /// It is a shallow view: each field value is the value itself, shared
+    /// with ``obj``, or, for a field whose annotation has an encoding hint,
+    /// as ``hessian2.Long`` does, a :class:`Typed` with that annotation, so
+    /// the value keeps its Java type wherever it is moved. Encoding the
+    /// result writes what encoding ``obj`` writes, unless something in
+    /// ``obj`` refers back to it, or field getters or converters return
+    /// different values when called again.
+    ///
+    /// Args:
+    ///     obj: The value.
+    ///
+    /// Returns:
+    ///     The object, ``obj`` itself for a :class:`HessianObject`, or
+    ///     ``None`` for a value of a type ``dumps`` writes in another form,
+    ///     such as a list, ``Decimal``, or ``Typed``. ``None`` does not
+    ///     check the value: ``dumps`` can still reject it, as it rejects an
+    ///     aware ``time``.
+    ///
+    /// Raises:
+    ///     EncodeError: If ``obj`` has no Hessian form under this codec, or
+    ///         as for ``dumps`` when a converter or a field's getter fails.
+    #[pyo3(signature = (obj, /))]
+    fn as_object(slf: &Bound<'_, Self>, obj: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
+        let registry = slf.get().snapshot(slf.py())?;
+        encode::as_object(slf.as_any(), registry.get(), obj)
+    }
+
     /// Decode a stream that holds exactly one value.
     ///
     /// Args:
     ///     data: The stream, as ``bytes`` or another buffer.
+    ///     type: An annotation the value must match, such as
+    ///         ``list[Order]``. It builds tuples, sets, and the classes it
+    ///         names, which need no registration. ``None`` or ``Any``
+    ///         decodes any value, building only registered classes.
     ///     unknown_class: Overrides the codec's ``unknown_class`` for this
-    ///         call.
+    ///         call, where ``type`` allows any value.
     ///
     /// Returns:
     ///     The value.
     ///
     /// Raises:
-    ///     DecodeError: If ``data`` is not one valid value under this codec
-    ///         or holds more than one; also wrapping, as its ``__cause__``, a
-    ///         ``ValueError`` or ``TypeError`` raised by a converter,
-    ///         post-init method, or default factory.
-    #[pyo3(signature = (data, *, unknown_class = None))]
+    ///     DecodeError: If ``data`` is not one valid value under this codec,
+    ///         holds more than one, or does not match ``type``; also
+    ///         wrapping, as its ``__cause__``, a ``ValueError`` or
+    ///         ``TypeError`` raised by a converter, post-init method, or
+    ///         default factory.
+    ///     TypeError: If ``type`` cannot be compiled: a string annotation, a
+    ///         union with several members that decode a list or a map, or a
+    ///         named class whose annotations do not resolve.
+    #[pyo3(signature = (data, *, r#type = None, unknown_class = None))]
     fn loads(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         data: &Bound<'_, PyAny>,
+        r#type: Option<&Bound<'_, PyAny>>,
         unknown_class: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
-        let unknown = self.unknown_for(unknown_class)?;
-        let registry = self.snapshot(py)?;
-        with_buffer(data, |bytes| {
-            let mut decoder = Decoder::new(py, bytes, registry.get(), unknown, self.max_depth);
-            let value = decoder.value()?;
-            decoder.finish()?;
-            Ok(value.unbind())
-        })
+        let mut value = None;
+        let types = r#type.map(std::slice::from_ref);
+        decode(slf, data, types, unknown_class, false, |decoded| {
+            value = Some(decoded.unbind());
+            Ok(())
+        })?;
+        Ok(value.expect("decode yields one value or fails"))
     }
 
     /// Decode every value in a stream.
     ///
     /// Args:
     ///     data: The stream, as ``bytes`` or another buffer.
-    ///     unknown_class: Overrides the codec's ``unknown_class`` for this
-    ///         call.
+    ///     types: An annotation for each value, as for ``loads``, or ``None``
+    ///         for a value without one, as for ``dumps_many``; the stream
+    ///         must hold exactly that many. ``types=None`` decodes every
+    ///         value without an annotation.
+    ///     unknown_class: As for ``loads``.
     ///
     /// Returns:
     ///     The values, in order.
     ///
     /// Raises:
-    ///     DecodeError: As for ``loads``.
-    #[pyo3(signature = (data, *, unknown_class = None))]
+    ///     DecodeError: As for ``loads``, or if the stream holds more or
+    ///         fewer values than ``types``.
+    ///     TypeError: As for ``loads``.
+    #[pyo3(signature = (data, *, types = None, unknown_class = None))]
     fn loads_many(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         data: &Bound<'_, PyAny>,
+        types: Option<&Bound<'_, PyAny>>,
         unknown_class: Option<&str>,
     ) -> PyResult<Py<PyList>> {
-        let unknown = self.unknown_for(unknown_class)?;
-        let registry = self.snapshot(py)?;
-        with_buffer(data, |bytes| {
-            let mut decoder = Decoder::new(py, bytes, registry.get(), unknown, self.max_depth);
-            let values = PyList::empty(py);
-            while !decoder.is_empty() {
-                values.append(decoder.value()?)?;
-            }
-            Ok(values.unbind())
-        })
+        let types = types
+            .map(|types| types.try_iter()?.collect::<PyResult<Vec<_>>>())
+            .transpose()?;
+        let values = PyList::empty(slf.py());
+        decode(slf, data, types.as_deref(), unknown_class, true, |value| {
+            values.append(value)
+        })?;
+        Ok(values.unbind())
+    }
+
+    /// Return a reader that decodes ``data`` one value at a time.
+    ///
+    /// The values share the stream's class definitions and references, as
+    /// they do for ``loads_many``, so the type of each value can depend on
+    /// the ones read before it, as Java's ``Hessian2Input.readObject`` and
+    /// :class:`pickle.Unpickler` read.
+    ///
+    /// Args:
+    ///     data: The stream, as ``bytes`` or another buffer, copied unless
+    ///         it is ``bytes``.
+    ///
+    /// Returns:
+    ///     The reader, which decodes with this codec's registrations at this
+    ///     call.
+    fn reader(slf: &Bound<'_, Self>, data: &Bound<'_, PyAny>) -> PyResult<Reader> {
+        let py = slf.py();
+        let this = slf.get();
+        let data = match data.cast::<PyBytes>() {
+            Ok(bytes) => bytes.clone(),
+            Err(_) => pyo3::types::PyMemoryView::from(data)?
+                .call_method0(intern!(py, "tobytes"))?
+                .cast_into::<PyBytes>()?,
+        };
+        Ok(Reader::new(
+            slf.as_any().clone().unbind(),
+            data.unbind(),
+            this.snapshot(py)?,
+            this.unknown,
+            this.max_depth,
+        ))
     }
 
     /// Returns the name a type is registered under for decoding, or `None`
@@ -516,27 +648,18 @@ impl Codec {
     /// since taken, or no entry.
     fn _registered_name(&self, py: Python<'_>, ty: &Bound<'_, PyType>) -> PyResult<Option<String>> {
         let registry = self.snapshot(py)?;
-        let registry = registry.get();
-        Ok(registry
-            .by_type
-            .get(&(ty.as_ptr() as usize))
-            .filter(|entry| {
-                !matches!(entry.get().kind, Kind::Value(_))
-                    && registry
-                        .by_name
-                        .get(&entry.get().name)
-                        .is_some_and(|named| named.is(*entry))
-            })
-            .map(|entry| entry.get().name.clone()))
+        Ok(registry.get().registered_name(ty).map(str::to_owned))
     }
 
-    /// Returns the entry for a dataclass or attrs class.
+    /// Returns the entry for a dataclass or attrs class, whose instances
+    /// `new` makes.
     #[staticmethod]
     fn _class_entry(
         py: Python<'_>,
         name: String,
         cls: Bound<'_, PyType>,
         fields: Vec<FieldSpec<'_>>,
+        new: Py<PyAny>,
         post_init: Option<(Bound<'_, PyString>, Bound<'_, PyTuple>)>,
     ) -> PyResult<Py<Entry>> {
         let fields = to_fields(py, fields)?;
@@ -547,15 +670,16 @@ impl Codec {
         let post_init = post_init.map(|(name, args)| (name.unbind(), args.unbind()));
         Py::new(
             py,
-            Entry {
+            Entry::new(
                 name,
-                ty: cls.unbind(),
-                kind: Kind::Class {
+                cls.unbind(),
+                Kind::Class {
                     fields,
                     bypass_setattr,
+                    new,
                     post_init,
                 },
-            },
+            ),
         )
     }
 
@@ -569,28 +693,14 @@ impl Codec {
     ) -> PyResult<Py<Entry>> {
         let fields = to_fields(py, fields)?;
         let kind = Kind::Tuple { fields };
-        Py::new(
-            py,
-            Entry {
-                name,
-                ty: cls.unbind(),
-                kind,
-            },
-        )
+        Py::new(py, Entry::new(name, cls.unbind(), kind))
     }
 
     /// Returns the entry for an Enum, sent by member name.
     #[staticmethod]
     fn _enum_entry(py: Python<'_>, name: String, cls: Bound<'_, PyType>) -> PyResult<Py<Entry>> {
         let kind = Kind::Enum;
-        Py::new(
-            py,
-            Entry {
-                name,
-                ty: cls.unbind(),
-                kind,
-            },
-        )
+        Py::new(py, Entry::new(name, cls.unbind(), kind))
     }
 
     /// Returns the entry for a `hessian2.Converter`.
@@ -603,14 +713,7 @@ impl Codec {
         decode: Py<PyAny>,
     ) -> PyResult<Py<Entry>> {
         let kind = Kind::Converter { encode, decode };
-        Py::new(
-            py,
-            Entry {
-                name,
-                ty: ty.unbind(),
-                kind,
-            },
-        )
+        Py::new(py, Entry::new(name, ty.unbind(), kind))
     }
 
     /// Registers entries with their `replace` flags, all or none.
@@ -625,6 +728,68 @@ impl Codec {
     }
 }
 
+/// Decodes all of `data`: one value per annotation in `types`, or without
+/// `types`, every value when `many` and else exactly one.
+fn decode<'py>(
+    slf: &Bound<'py, Codec>,
+    data: &Bound<'py, PyAny>,
+    types: Option<&[Bound<'py, PyAny>]>,
+    unknown_class: Option<&str>,
+    many: bool,
+    mut each: impl FnMut(Bound<'py, PyAny>) -> PyResult<()>,
+) -> PyResult<()> {
+    let py = slf.py();
+    let this = slf.get();
+    let unknown = this.unknown_for(unknown_class)?;
+    let compiled = types
+        .map(|types| {
+            types
+                .iter()
+                .map(|annotation| typed::lookup(slf.as_any(), annotation))
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()?;
+    let registry = this.snapshot(py)?;
+    with_buffer(data, |bytes| {
+        let mut decoder = Decoder::new(
+            py,
+            bytes,
+            registry.get(),
+            unknown,
+            this.max_depth,
+            slf.as_any(),
+        );
+        let mut index = 0;
+        let result = (|| {
+            match &compiled {
+                Some(types) => {
+                    for ty in types {
+                        each(decoder.typed(&ty.get().0)?)?;
+                        index += 1;
+                    }
+                }
+                None if many => {
+                    while !decoder.is_empty() {
+                        each(decoder.value()?)?;
+                        index += 1;
+                    }
+                }
+                None => each(decoder.value()?)?,
+            }
+            decoder.finish()
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            // Several values are a list: the path starts with the value's index.
+            Err(error) if many => {
+                let error = decoder.at(error, || format!("[{index}]"));
+                Err(decoder.locate(error))
+            }
+            Err(error) => Err(decoder.locate(error)),
+        }
+    })
+}
+
 fn length_mismatch(types: usize) -> PyErr {
     PyValueError::new_err(format!(
         "types has {types} annotations, but values has a different number of items"
@@ -632,20 +797,24 @@ fn length_mismatch(types: usize) -> PyErr {
 }
 
 /// A field as the Python package describes it: attribute name, wire name,
-/// default kind (0 required, 1 value, 2 factory), default, and encoding hint
-/// plan.
+/// default kind (0 required, 1 value, 2 factory), default, encoding hint
+/// plan, decoding type plan, annotation, and the annotation with its
+/// namespace or `None`.
 type FieldSpec<'py> = (
     Bound<'py, PyString>,
     String,
     u8,
     Py<PyAny>,
     Bound<'py, PyAny>,
+    Bound<'py, PyAny>,
+    Py<PyAny>,
+    Option<Py<PyAny>>,
 );
 
 fn to_fields(py: Python<'_>, specs: Vec<FieldSpec<'_>>) -> PyResult<Vec<Field>> {
     let mut names = HashSet::with_capacity(specs.len());
     let mut fields = Vec::with_capacity(specs.len());
-    for (attr, wire, kind, default, plan) in specs {
+    for (attr, wire, kind, default, plan, ty, annotation, scope) in specs {
         if !names.insert(wire.clone()) {
             return Err(PyValueError::new_err(format!(
                 "multiple Python fields map to {}; choose distinct field names",
@@ -662,9 +831,53 @@ fn to_fields(py: Python<'_>, specs: Vec<FieldSpec<'_>>) -> PyResult<Vec<Field>> 
                 _ => Default::Factory(default),
             },
             hint: Hint::parse(&plan)?,
+            annotation: (!plan.is_none()).then_some(annotation),
+            scope: scope.filter(|_| !plan.is_none()),
+            ty: Type::parse(&ty)?,
         });
     }
     Ok(fields)
+}
+
+/// Returns the entry a class's own `hessian2.java_class` declaration maps it
+/// with, built by the codec's `_declared` method on first use and cached on
+/// the declaration, or `None` when the class has no declaration of its own.
+///
+/// # Errors
+///
+/// Propagates errors from `_declared`, such as annotations that do not
+/// resolve.
+/// Returns how to give `ty` a Java class, for an error, or `None` when it
+/// maps to Java types of its own; the codec's `_advice` decides.
+#[cold]
+pub fn advice(codec: &Bound<'_, PyAny>, ty: &Bound<'_, PyType>) -> PyResult<Option<String>> {
+    codec
+        .call_method1(intern!(codec.py(), "_advice"), (ty,))?
+        .extract()
+}
+
+pub fn declared_entry<'py>(
+    codec: &Bound<'py, PyAny>,
+    ty: &Bound<'py, PyType>,
+) -> PyResult<Option<Bound<'py, Entry>>> {
+    let py = ty.py();
+    // An attribute lookup hits CPython's per-type cache and allocates
+    // nothing when absent, so undeclared classes need no cache of ours.
+    let Some(found) = ty.getattr_opt(intern!(py, "__hessian2__"))? else {
+        return Ok(None);
+    };
+    // Declared on the class itself: a subclass does not inherit it.
+    let own = ty
+        .getattr(intern!(py, "__dict__"))?
+        .call_method1(intern!(py, "get"), (intern!(py, "__hessian2__"),))?;
+    if !own.is(&found) {
+        return Ok(None);
+    }
+    let mut entry = own.getattr(intern!(py, "entry"))?;
+    if entry.is_none() {
+        entry = codec.call_method1(intern!(py, "_declared"), (ty,))?;
+    }
+    Ok(Some(entry.cast_into::<Entry>()?))
 }
 
 /// Runs `consume` over the bytes of a buffer-protocol object.

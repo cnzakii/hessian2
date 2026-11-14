@@ -1,6 +1,6 @@
 //! Hash maps keyed by object addresses, which SipHash would only slow down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// Multiplies by a 64-bit odd constant and rotates the well-mixed high bits
@@ -30,3 +30,6 @@ impl Hasher for AddressHasher {
 }
 
 pub type AddressMap<V> = HashMap<usize, V, BuildHasherDefault<AddressHasher>>;
+
+/// A set of address pairs, such as (value, type), hashed as [`AddressMap`] keys.
+pub type AddressSet = HashSet<(usize, usize), BuildHasherDefault<AddressHasher>>;

@@ -41,7 +41,7 @@ import com.caucho.hessian.test.TestHessian2Servlet;
  *                       {NAME: description or {"error": message}}; suite values also run arg*
  * inventory            all arg* methods and their matching reply* names
  * types READER DIR      reads each DIR/NAME.bin as the Java type DIR/NAME.type
- *                       names, as an RPC provider reads a declared parameter,
+ *                       names, as Java code reads a value of a declared type,
  *                       and prints {NAME: the Java classes it holds}
  * </pre>
  */

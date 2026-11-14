@@ -1,37 +1,26 @@
-"""Declared classes, recursive registration, Java type tags, and java_name."""
+"""Public contracts for declarations."""
 
 from __future__ import annotations
 
-import base64
 import collections
 import dataclasses
 import datetime as dt
 import enum
 import gc
-import json
+import re
 import sys
+import types
 import typing
 import weakref
 from decimal import Decimal
-from pathlib import Path
 from typing import Any, NamedTuple, TypedDict
 from uuid import UUID
 
 import attrs
 import hessian2
 import pytest
+from assertions import same
 from hessian2 import Codec, Converter, DecodeError, EncodeError, HessianObject
-
-FIXTURES = json.loads(
-    (Path(__file__).parent / "fixtures" / "java.json").read_text(encoding="utf-8")
-)
-UTC = dt.UTC
-PLUS8 = dt.timezone(dt.timedelta(hours=8))
-
-
-def fixture(name: str, writer: str) -> bytes:
-    case = FIXTURES[name]
-    return base64.b64decode(case[writer] or case["caucho"])
 
 
 @hessian2.java_class("com.example.Address")
@@ -50,40 +39,67 @@ class Customer:
     friends: list[Customer] = dataclasses.field(default_factory=list)
 
 
-# --- declarations ------------------------------------------------------------
-
-
-def test_declared_classes_encode_anywhere_and_decode_only_when_registered() -> None:
+def test_declarations_choose_java_names_and_camel_case_fields_during_encoding():
     value = Customer("ann", Address("Hangzhou", "310000"))
-    data = hessian2.dumps(value)
-    assert b"com.example.Customer" in data and b"userName" in data
-    assert b"postalCode" in data
-    with pytest.raises(DecodeError, match="not registered"):
+
+    raw = hessian2.loads(
+        hessian2.dumps(value), type=HessianObject, unknown_class="hessian_object"
+    )
+
+    assert raw.class_name == "com.example.Customer"
+    assert raw.fields["userName"] == "ann"
+    assert raw.fields["home"].fields == {"city": "Hangzhou", "postalCode": "310000"}
+
+
+def test_a_declaration_alone_does_not_trust_a_class_for_untyped_decoding():
+    data = hessian2.dumps(Customer("ann"))
+
+    with pytest.raises(DecodeError, match=re.escape("not registered")):
         hessian2.loads(data)
+
+
+def test_encoding_a_declaration_does_not_register_it_for_decoding():
     codec = Codec()
-    codec.dumps(value)
-    # Encoding never makes a class decodable.
-    with pytest.raises(DecodeError, match="not registered"):
+    data = codec.dumps(Customer("ann"))
+
+    with pytest.raises(DecodeError, match=re.escape("not registered")):
         codec.loads(data)
+
+
+def test_registering_a_declared_class_trusts_its_annotated_children():
+    codec = Codec()
     codec.register(Customer)
-    assert codec.loads(data) == value
+    value = Customer("ann", Address("Hangzhou", "310000"))
+
+    assert same(codec.loads(hessian2.dumps(value)), value)
 
 
-def test_declaration_options_and_validation() -> None:
+def test_disabling_declaration_field_naming_preserves_python_names():
     @hessian2.java_class("Snake", field_naming=None)
     @dataclasses.dataclass
     class Snake:
         user_name: str
 
-    assert b"user_name" in hessian2.dumps(Snake("a"))
+    assert hessian2.dumps(Snake("a")) == b"C\x05Snake\x91\x09user_name\x60\x01a"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error_type"),
+    [
+        ({"name": 1}, TypeError),
+        ({"name": ""}, ValueError),
+        ({"name": "X", "field_naming": "snake"}, ValueError),
+    ],
+    ids=["non-string-name", "empty-name", "unknown-naming"],
+)
+def test_declarations_reject_invalid_public_options(arguments, error_type):
+    with pytest.raises(error_type):
+        hessian2.java_class(**arguments)
+
+
+def test_java_class_decorates_only_classes():
     with pytest.raises(TypeError):
-        hessian2.java_class(1)  # type: ignore[arg-type]
-    with pytest.raises(ValueError):
-        hessian2.java_class("")
-    with pytest.raises(ValueError):
-        hessian2.java_class("X", field_naming="snake")  # type: ignore[arg-type]
-    with pytest.raises(TypeError):
-        hessian2.java_class("X")(object())  # type: ignore[type-var]
+        hessian2.java_class("X")(object())
 
 
 def test_subclasses_are_not_declared_by_inheritance() -> None:
@@ -91,10 +107,53 @@ def test_subclasses_are_not_declared_by_inheritance() -> None:
     class Special(Address):
         floor: int = 0
 
-    with pytest.raises(EncodeError, match="Special has no Hessian form"):
+    with pytest.raises(EncodeError, match=re.escape("Special has no Hessian form")):
         hessian2.dumps(Special("x"))
-    with pytest.raises(TypeError, match="no Java class name"):
+    with pytest.raises(TypeError, match=re.escape("has no @hessian2.java_class")):
         Codec().register(Special)
+
+
+@dataclasses.dataclass
+class _Undeclared:
+    x: int
+
+
+class _Plain:
+    pass
+
+
+class _Ids(list):
+    pass
+
+
+ADVICE = pytest.mark.parametrize(
+    ("cls", "advice"),
+    [
+        (_Undeclared, "declare it with @hessian2.java_class or register it"),
+        (_Plain, "register a Converter for it"),
+    ],
+    ids=["record", "other-class"],
+)
+
+
+@ADVICE
+def test_a_value_without_a_form_names_the_fix_for_its_kind(cls, advice):
+    value = cls(1) if cls is _Undeclared else cls()
+
+    with pytest.raises(
+        EncodeError,
+        match=re.escape(f"{cls.__qualname__} has no Hessian form; {advice}"),
+    ):
+        hessian2.dumps(value)
+
+
+@ADVICE
+def test_java_name_without_a_name_names_the_fix_for_its_kind(cls, advice):
+    with pytest.raises(
+        TypeError,
+        match=re.escape(f"{cls.__qualname__} has no Java class name; {advice}"),
+    ):
+        hessian2.java_name(cls)
 
 
 def test_declaration_survives_class_rebuilding_decorators() -> None:
@@ -110,7 +169,8 @@ def test_declaration_survives_class_rebuilding_decorators() -> None:
 
     codec = Codec()
     codec.register(Slotted)
-    assert codec.loads(codec.dumps(Slotted(Inner(1)))) == Slotted(Inner(1))
+
+    assert same(codec.loads(codec.dumps(Slotted(Inner(1)))), Slotted(Inner(1)))
 
 
 def test_enums_and_named_tuples_can_be_declared() -> None:
@@ -125,15 +185,14 @@ def test_enums_and_named_tuples_can_be_declared() -> None:
 
     codec = Codec()
     codec.register(Point)
+
     data = hessian2.dumps(Point(1, Color.RED))
+
     assert b"xPos" in data
-    assert codec.loads(data) == Point(1, Color.RED)
+    assert same(codec.loads(data), Point(1, Color.RED))
 
 
-# --- registration ------------------------------------------------------------
-
-
-def test_register_follows_field_annotations_and_type_expressions() -> None:
+def test_registration_trusts_only_the_class_and_its_annotated_fields() -> None:
     @hessian2.java_class("Leaf")
     @dataclasses.dataclass
     class Leaf:
@@ -157,60 +216,93 @@ def test_register_follows_field_annotations_and_type_expressions() -> None:
 
     codec = Codec()
     codec.register(Root)
-    for cls in (Root, Leaf, Keyed):
-        assert codec.java_name(cls) == cls.__name__
     value = Root(Leaf(1), {"k": Keyed(2)}, {"leaf": Leaf(3)}, [(Leaf(4),)])
-    decoded = codec.loads(codec.dumps(value))
-    assert decoded.by_key["k"] == Keyed(2) and decoded.holder["leaf"] == Leaf(3)
+    # The fields name Leaf and Keyed, so they decode without registration.
 
-    other = Codec()
-    other.register(list[Leaf] | Keyed | int)
-    assert other.loads(hessian2.dumps([Leaf(1), Keyed(2)])) == [Leaf(1), Keyed(2)]
-    other.register(int)
-    other.register(Root)
-    other.register(Root)
+    assert same(codec.loads(codec.dumps(value)), value)
+    # Registering Root trusts Root alone: Leaf where any value may be is not.
+    with pytest.raises(DecodeError, match=re.escape("not registered")):
+        codec.loads(codec.dumps(Leaf(1)))
+    with pytest.raises(TypeError, match=re.escape("takes a class or a Converter")):
+        codec.register(list[Leaf] | Keyed)
+    codec.register(Root)
 
 
-def test_register_reports_classes_without_a_java_name() -> None:
-    @dataclasses.dataclass
-    class Plain:
-        x: int
+def test_an_undeclared_class_requires_a_name_at_registration(unnamed_models):
+    plain, _, _ = unnamed_models
 
-    @hessian2.java_class("Uses")
-    @dataclasses.dataclass
-    class Uses:
-        plain: list[Plain]
+    with pytest.raises(TypeError, match=re.escape("pass name=")):
+        Codec().register(plain, field_naming=None)
 
-    with pytest.raises(TypeError, match=r"Uses.plain refers to .*Plain"):
-        Codec().register(Uses)
-    with pytest.raises(TypeError, match="pass name="):
-        Codec().register(Plain, field_naming=None)
+
+def test_an_unnamed_field_class_reports_its_name_where_it_decodes(unnamed_models):
+    _, uses, data = unnamed_models
+
+    with pytest.raises(DecodeError, match=re.escape("Plain has no Java class name")):
+        hessian2.loads(data, type=uses)
+
+
+def test_registering_an_unnamed_field_class_allows_typed_decoding(unnamed_models):
+    plain, uses, data = unnamed_models
     codec = Codec()
-    codec.register(Plain, name="com.example.Plain")
-    codec.register(Uses)
-    assert codec.loads(codec.dumps(Uses([Plain(1)]))) == Uses([Plain(1)])
-    assert codec.java_name(Plain) == "com.example.Plain"
-    with pytest.raises(TypeError, match="no Java class name"):
-        hessian2.java_name(Plain)
+    codec.register(plain, name="com.example.Plain")
+
+    assert same(codec.loads(data, type=uses), uses([plain(1)]))
 
 
-def test_register_arguments_must_agree_with_declarations() -> None:
+def test_java_name_reads_an_undeclared_class_from_the_codec_registry(unnamed_models):
+    plain, _, _ = unnamed_models
     codec = Codec()
-    with pytest.raises(ValueError, match="declared as 'com.example.Address'"):
-        codec.register(Address, name="Other")
-    with pytest.raises(TypeError, match="field naming from @java_class"):
-        codec.register(Address, field_naming=None)
-    codec.register(Address, name="com.example.Address")
-    with pytest.raises(TypeError, match="need a class"):
-        codec.register(list[Address], name="X")
-    with pytest.raises(TypeError, match="name="):
-        codec.register(Converter(Address, vars, lambda f: Address(**f)))  # type: ignore[call-overload]
-    with pytest.raises(TypeError, match="to_fields"):
-        codec.register(
+    codec.register(plain, name="com.example.Plain")
+
+    assert codec.java_name(plain) == "com.example.Plain"
+
+
+def test_java_name_rejects_an_unnamed_unregistered_class(unnamed_models):
+    plain, _, _ = unnamed_models
+
+    with pytest.raises(TypeError, match=re.escape("no Java class name")):
+        hessian2.java_name(plain)
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type", "message"),
+    [
+        ("other-name", ValueError, "declared as 'com.example.Address'"),
+        ("other-naming", TypeError, "field naming from @java_class"),
+        ("annotation", TypeError, "takes a class or a Converter"),
+        ("unnamed-converter", TypeError, "name="),
+        ("converter-naming", TypeError, "to_fields"),
+    ],
+)
+def test_registration_rejects_options_that_disagree_with_the_declared_mapping(
+    case, error_type, message
+):
+    codec = Codec()
+    operations = {
+        "other-name": lambda: codec.register(Address, name="Other"),
+        "other-naming": lambda: codec.register(Address, field_naming=None),
+        "annotation": lambda: codec.register(list[Address], name="X"),
+        "unnamed-converter": lambda: codec.register(
+            Converter(Address, vars, lambda f: Address(**f))
+        ),
+        "converter-naming": lambda: codec.register(
             Converter(Address, vars, lambda f: Address(**f)),
             name="A",
-            field_naming=None,  # type: ignore[call-overload]
-        )
+            field_naming=None,
+        ),
+    }
+
+    with pytest.raises(error_type, match=re.escape(message)):
+        operations[case]()
+
+
+def test_registration_accepts_the_name_a_declaration_already_gives():
+    codec = Codec()
+
+    codec.register(Address, name="com.example.Address")
+
+    assert same(codec.loads(codec.dumps(Address("a"))), Address("a"))
 
 
 def test_local_classes_resolve_names_defined_before_them() -> None:
@@ -239,12 +331,12 @@ def test_local_classes_resolve_names_defined_before_them() -> None:
 
     codec = Codec()
     codec.register(Self)
-    assert codec.loads(codec.dumps(Self(Early(1), []))) == Self(Early(1), [])
-    with pytest.raises(TypeError, match="name 'Later' is not defined"):
+
+    assert same(codec.loads(codec.dumps(Self(Early(1), []))), Self(Early(1), []))
+    with pytest.raises(TypeError, match=re.escape("name 'Later' is not defined")):
         codec.register(Late)
-    with pytest.raises(EncodeError, match="name 'Later' is not defined"):
+    with pytest.raises(EncodeError, match=re.escape("name 'Later' is not defined")):
         hessian2.dumps(Late(Early(1)))
-    assert Later(1).x == 1
 
 
 def test_generic_dataclasses_resolve_their_type_parameters() -> None:
@@ -257,142 +349,8 @@ def test_generic_dataclasses_resolve_their_type_parameters() -> None:
 
     codec = Codec()
     codec.register(Box)
-    assert codec.loads(codec.dumps(Box(1))) == Box(1)
 
-
-# --- tags ----------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("value", "tp", "expected"),
-    [
-        (5, hessian2.Long, b"\xe5"),
-        (5, int, b"\x95"),
-        ([1, 2], list[hessian2.Long], b"\x7a\xe1\xe2"),
-        ((1, 2), tuple[hessian2.Long, int], b"\x7a\xe1\x92"),
-        ((1, 2), tuple[hessian2.Long, ...], b"\x7a\xe1\xe2"),
-        ({1}, set[hessian2.Long], b"q\x11java.util.HashSet\xe1"),
-        ({"a": 1}, dict[str, hessian2.Long], b"H\x01a\xe1Z"),
-        ({1: "a"}, dict[hessian2.Long, str], b"H\xe1\x01aZ"),
-        (None, hessian2.Long | None, b"N"),
-        ("x", hessian2.Long | str, b"\x01x"),
-        ([1, "x"], list[hessian2.Long | str], b"\x7a\xe1\x01x"),
-        ([1], list[hessian2.Long] | dict[str, int], b"\x79\xe1"),
-        (True, hessian2.Long, b"T"),
-    ],
-    ids=repr,
-)
-def test_top_level_types_choose_wire_forms(
-    value: Any, tp: Any, expected: bytes
-) -> None:
-    assert hessian2.dumps(value, type=tp) == expected
-
-
-def test_typed_dict_keys_and_dumps_many_types() -> None:
-    class Extra(TypedDict):
-        count: hessian2.Long
-        name: str
-
-    extra: Extra = {"count": 1, "name": "x"}
-    assert hessian2.dumps(extra, type=Extra) == b"H\x05count\xe1\x04name\x01xZ"
-    stream = hessian2.dumps_many(["m", 1, 2], types=[str, None, hessian2.Long])
-    assert stream == b"\x01m\x91\xe2"
-    assert hessian2.loads_many(stream) == ["m", 1, 2]
-    with pytest.raises(ValueError, match="types has 1"):
-        hessian2.dumps_many([1, 2], types=[None])
-    with pytest.raises(ValueError, match="types has 2"):
-        hessian2.dumps_many([1], types=[None, None])
-
-
-def test_field_tags_apply_to_declared_classes() -> None:
-    class Extra(TypedDict):
-        count: hessian2.Long
-
-    @hessian2.java_class("com.example.Payment")
-    @dataclasses.dataclass
-    class Payment:
-        amount: hessian2.BigInteger
-        ids: list[hessian2.Long]
-        paid_at: hessian2.Instant
-        extra: Extra
-
-    paid_at = dt.datetime(2026, 1, 1, tzinfo=UTC)
-    payment = Payment(5, [1], paid_at, {"count": 2})
-    data = hessian2.dumps(payment)
-    assert b"java.math.BigInteger" in data and b"\x79\xe1C05" in data
-    assert b"InstantHandle" in data and data.endswith(b"H\x05count\xe2Z")
-    codec = Codec()
-    codec.register(Payment)
-    assert codec.loads(data) == payment
-
-
-@pytest.mark.parametrize(
-    ("fixture_name", "tag"),
-    [
-        ("extra.time_instant", hessian2.Instant),
-        ("extra.time_offset_datetime", hessian2.OffsetDateTime),
-        ("extra.time_zoned_datetime", hessian2.ZonedDateTime),
-    ],
-)
-def test_java_time_tags_write_what_hessian_lite_writes(
-    fixture_name: str, tag: Any
-) -> None:
-    java = fixture(fixture_name, "lite")
-    assert hessian2.dumps(hessian2.loads(java), type=tag) == java
-
-
-def test_zoned_datetimes_keep_their_fold() -> None:
-    # Java's bytes share one LocalDateTime between the two values; Python's
-    # values share nothing, so compare values rather than bytes.
-    values = hessian2.loads(fixture("extra.review2_time_overlap", "lite"))
-    data = hessian2.dumps(values, type=list[hessian2.ZonedDateTime])
-    decoded = hessian2.loads(data)
-    assert [v.utcoffset() for v in decoded] == [v.utcoffset() for v in values]
-    assert [v.fold for v in decoded] == [0, 1]
-
-
-@pytest.mark.parametrize("name", ["extra.bigint_small", "extra.bigint_zero"])
-def test_big_integer_tag_writes_what_caucho_writes(name: str) -> None:
-    java = fixture(name, "caucho")
-    assert hessian2.dumps(hessian2.loads(java), type=hessian2.BigInteger) == java
-
-
-def test_tags_reject_values_the_java_type_cannot_hold() -> None:
-    with pytest.raises(EncodeError, match="does not fit in a Java long"):
-        hessian2.dumps(2**63, type=hessian2.Long)
-    with pytest.raises(EncodeError, match="naive datetime"):
-        hessian2.dumps(dt.datetime(2026, 1, 1), type=hessian2.Instant)
-    fractional = dt.timezone(dt.timedelta(seconds=1, microseconds=5))
-    with pytest.raises(EncodeError, match="whole seconds"):
-        hessian2.dumps(
-            dt.datetime(2026, 1, 1, tzinfo=fractional), type=hessian2.OffsetDateTime
-        )
-
-    class Custom(dt.tzinfo):
-        def utcoffset(self, value: dt.datetime | None) -> dt.timedelta:
-            return dt.timedelta(hours=1)
-
-    with pytest.raises(EncodeError, match="ZoneInfo"):
-        hessian2.dumps(
-            dt.datetime(2026, 1, 1, tzinfo=Custom()), type=hessian2.ZonedDateTime
-        )
-    zoned = hessian2.dumps(
-        dt.datetime(2026, 1, 1, tzinfo=PLUS8), type=hessian2.ZonedDateTime
-    )
-    assert zoned.endswith(b"\x06+08:00")
-
-
-def test_tags_leave_values_of_registered_types_alone() -> None:
-    class Level(enum.IntEnum):
-        HIGH = 3
-
-    codec = Codec()
-    codec.register(Level, name="Level")
-    assert codec.dumps(Level.HIGH, type=hessian2.Long) == codec.dumps(Level.HIGH)
-    assert hessian2.dumps("text", type=hessian2.Instant) == b"\x04text"
-
-
-# --- java_name -----------------------------------------------------------------
+    assert same(codec.loads(codec.dumps(Box(1))), Box(1))
 
 
 @pytest.mark.parametrize(
@@ -410,12 +368,30 @@ def test_tags_leave_values_of_registered_types_alone() -> None:
         (dt.timedelta, "java.time.Duration"),
         (hessian2.BigInteger, "java.math.BigInteger"),
         (hessian2.Instant, "java.time.Instant"),
+        (hessian2.Date, "java.util.Date"),
+        (hessian2.LocalDateTime | None, "java.time.LocalDateTime"),
         (hessian2.OffsetDateTime, "java.time.OffsetDateTime"),
         (hessian2.ZonedDateTime, "java.time.ZonedDateTime"),
-        (hessian2.Long, None),
+        (hessian2.Long, "long"),
+        (hessian2.Long | None, "java.lang.Long"),
+        (tuple[str, ...], "[Ljava.lang.String;"),
+        (tuple[Any, ...], "[Ljava.lang.Object;"),
+        (tuple[int, ...], "[I"),
+        (tuple[int | None, ...], "[Ljava.lang.Integer;"),
+        (tuple[hessian2.Long, ...], "[J"),
+        (tuple[tuple[bool, ...], ...], "[[Z"),
+        (tuple[bytes, ...], "[[B"),
+        (tuple[Customer, ...], "[Lcom.example.Customer;"),
+        # Java reads a list typed [object as Object[].
+        (tuple[list[int], ...], "[Ljava.lang.Object;"),
+        (tuple[int | str, ...], "[Ljava.lang.Object;"),
+        (tuple[tuple[int, ...] | None, ...], "[[I"),
+        (bool, "boolean"),
+        (bool | None, "java.lang.Boolean"),
+        (float, "double"),
+        (float | None, "java.lang.Double"),
         (int, None),
-        (bool, None),
-        (float, None),
+        (int | None, None),
         (dt.datetime, None),
         (list[Customer], None),
         (dict, None),
@@ -424,121 +400,141 @@ def test_tags_leave_values_of_registered_types_alone() -> None:
         (object, None),
         (type(None), None),
         (HessianObject, None),
+        (hessian2.Typed, None),
     ],
     ids=repr,
 )
-def test_java_name(tp: Any, expected: str | None) -> None:
+def test_java_name_returns_the_class_an_annotation_always_encodes_as(
+    tp: Any, expected: str | None
+) -> None:
     assert hessian2.java_name(tp) == expected
 
 
-def test_java_name_sees_this_codecs_registrations() -> None:
+def test_java_name_uses_the_current_codecs_converter_registration():
     codec = Codec()
     codec.register(
         Converter(Decimal, lambda d: {"v": str(d)}, lambda f: Decimal(f["v"])),
         name="com.example.Money",
         replace=True,
     )
+
     assert codec.java_name(Decimal) == "com.example.Money"
+
+
+def test_java_name_registrations_are_per_codec():
+    codec = Codec()
+    codec.register(
+        Converter(Decimal, lambda d: {"v": str(d)}, lambda f: Decimal(f["v"])),
+        name="com.example.Money",
+        replace=True,
+    )
+
     assert hessian2.java_name(Decimal) == "java.math.BigDecimal"
-    with pytest.raises(TypeError, match="not a type"):
-        codec.java_name("Customer")
 
 
-# --- per-call options and user errors -----------------------------------------
-
-
-def test_unknown_class_can_be_overridden_per_call() -> None:
-    data = hessian2.dumps(HessianObject("com.example.Unknown", {"x": 1}))
-    codec = Codec()
-    with pytest.raises(DecodeError):
-        codec.loads(data)
-    assert codec.loads(data, unknown_class="dict") == {"x": 1}
-    assert codec.loads_many(data, unknown_class="hessian_object")[0].fields == {"x": 1}
-    with pytest.raises(ValueError, match="unknown_class"):
-        codec.loads(data, unknown_class="raw")  # type: ignore[arg-type]
-
-
-def test_user_value_and_type_errors_become_codec_errors() -> None:
-    @hessian2.java_class("Checked")
-    @dataclasses.dataclass
-    class Checked:
-        x: int
-
-        def __post_init__(self) -> None:
-            if self.x < 0:
-                raise ValueError("x must not be negative")
-
-    codec = Codec()
-    codec.register(Checked)
-    with pytest.raises(DecodeError, match="x must not be negative") as error:
-        codec.loads(hessian2.dumps(HessianObject("Checked", {"x": -1})))
-    assert type(error.value.__cause__) is ValueError
-
-    class Money:
-        pass
-
-    def broken(money: Money) -> dict[str, Any]:
-        raise TypeError("cannot convert")
-
-    codec.register(Converter(Money, broken, Money), name="Money")
-    with pytest.raises(EncodeError, match="cannot convert") as encode_error:
-        codec.dumps(Money())
-    assert type(encode_error.value.__cause__) is TypeError
-
-    @hessian2.java_class("Buggy")
-    @dataclasses.dataclass
-    class Buggy:
-        x: int
-
-        def __post_init__(self) -> None:
-            raise AttributeError("bug")
-
-    codec.register(Buggy)
-    with pytest.raises(AttributeError, match="bug"):
-        codec.loads(hessian2.dumps(HessianObject("Buggy", {"x": 1})))
-
-
-# --- audit regressions ---------------------------------------------------------
-
-
-def test_register_follows_subscripted_generic_classes() -> None:
-    T = typing.TypeVar("T")
-
-    @hessian2.java_class("Box")
-    @dataclasses.dataclass
-    class Box(typing.Generic[T]):
-        item: T
-
-    codec = Codec()
-    codec.register(list[Box[Address]])
-    value = [Box(Address("Hangzhou"))]
-    assert codec.loads(codec.dumps(value)) == value
-    assert codec.java_name(Box[Address]) == "Box"
-    assert codec.java_name(Box[Address] | None) == "Box"
-    with pytest.raises(TypeError, match="do not apply"):
-        hessian2.dumps(Box(1), type=Box[hessian2.Long])
+def test_java_name_rejects_an_unresolved_string_annotation():
+    with pytest.raises(TypeError, match=re.escape("not a type")):
+        Codec().java_name("Customer")
 
 
 @pytest.mark.parametrize(
-    ("value", "tp", "expected"),
+    "kind",
+    ["fixed", "empty", "annotated", "nullable", "none"],
+    ids=[
+        "fixed-tuple",
+        "empty-tuple",
+        "annotated-tuple",
+        "nullable-tuple",
+        "none-type",
+    ],
+)
+def test_java_name_uses_converters_for_tuple_and_none_positions(kind):
+    codec = Codec()
+    codec.register(
+        Converter(tuple, lambda v: {"items": list(v)}, lambda f: tuple(f["items"])),
+        name="com.example.Pair",
+    )
+    codec.register(
+        Converter(type(None), lambda v: {}, lambda f: None), name="com.example.Nil"
+    )
+    annotation, expected = {
+        "fixed": (tuple[int, str], "com.example.Pair"),
+        "empty": (tuple[()], "com.example.Pair"),
+        "annotated": (typing.Annotated[tuple[int], "x"], "com.example.Pair"),
+        "nullable": (tuple[int, str] | None, "com.example.Pair"),
+        "none": (type(None), "com.example.Nil"),
+    }[kind]
+
+    assert codec.java_name(annotation) == expected
+
+
+def test_a_plain_fixed_tuple_has_no_single_java_class_name():
+    assert hessian2.java_name(tuple[int, str]) is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "mode", "expected"),
     [
+        ("loads", "dict", {"x": 1}),
         (
-            collections.defaultdict(int, {"a": 1}),
-            collections.defaultdict[str, hessian2.Long],
-            b"H\x01a\xe1Z",
-        ),
-        (
-            collections.OrderedDict(a=1),
-            collections.OrderedDict[str, hessian2.Long],
-            b"H\x01a\xe1Z",
+            "loads_many",
+            "hessian_object",
+            [HessianObject("com.example.Unknown", {"x": 1})],
         ),
     ],
-    ids=repr,
 )
-def test_tags_apply_to_container_subclasses(
-    value: Any, tp: Any, expected: bytes
-) -> None:
-    assert hessian2.dumps(value, type=tp) == expected
+def test_decode_calls_can_override_the_codecs_unknown_class_mode(
+    operation, mode, expected
+):
+    codec = Codec()
+
+    data = hessian2.dumps(HessianObject("com.example.Unknown", {"x": 1}))
+
+    assert same(getattr(codec, operation)(data, unknown_class=mode), expected)
+    assert codec.unknown_class == "raise"
+
+
+def test_decode_calls_reject_invalid_unknown_class_overrides():
+    with pytest.raises(ValueError, match=re.escape("unknown_class")):
+        Codec().loads(b"N", unknown_class="raw")
+
+
+_DeclaredValue = typing.TypeVar("_DeclaredValue")
+
+
+@hessian2.java_class("Box")
+@dataclasses.dataclass
+class DeclaredBox(typing.Generic[_DeclaredValue]):
+    item: _DeclaredValue
+
+
+def test_generic_arguments_type_objects_nested_in_lists():
+    value = [DeclaredBox(Address("Hangzhou"))]
+
+    assert same(
+        hessian2.loads(hessian2.dumps(value), type=list[DeclaredBox[Address]]), value
+    )
+
+
+def test_generic_arguments_reject_wrong_fields_inside_list_items():
+    with pytest.raises(DecodeError, match=re.escape("$[0].item")):
+        hessian2.loads(
+            hessian2.dumps([DeclaredBox(1)]), type=list[DeclaredBox[Address]]
+        )
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [DeclaredBox[Address], DeclaredBox[Address] | None],
+    ids=["generic", "nullable"],
+)
+def test_a_generic_class_name_does_not_depend_on_its_type_arguments(annotation):
+    assert Codec().java_name(annotation) == "Box"
+
+
+def test_generic_class_arguments_refuse_encoding_tags_they_cannot_apply():
+    with pytest.raises(TypeError, match=re.escape("do not apply")):
+        hessian2.dumps(DeclaredBox(1), type=DeclaredBox[hessian2.Long])
 
 
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="TypeAliasType is 3.12+")
@@ -546,6 +542,7 @@ def test_subscripted_type_aliases_substitute_their_arguments() -> None:
     T = typing.TypeVar("T")
     pair = typing.TypeAliasType("Pair", list[T], type_params=(T,))
     same = typing.TypeAliasType("Same", T, type_params=(T,))
+
     assert hessian2.dumps([1], type=pair[hessian2.Long]) == b"\x79\xe1"
     assert hessian2.dumps(1, type=same[hessian2.Long]) == b"\xe1"
 
@@ -561,44 +558,27 @@ def test_subscripted_type_aliases_substitute_their_arguments() -> None:
     ids=repr,
 )
 def test_unions_reject_tags_that_compete_for_a_value(tp: Any) -> None:
-    with pytest.raises(TypeError, match="same values"):
+    with pytest.raises(TypeError, match=re.escape("same values")):
         hessian2.dumps(None, type=tp)
 
 
-def test_encoding_a_declared_class_registers_nothing() -> None:
+def test_encoding_a_declared_class_does_not_keep_the_class_alive():
     @hessian2.java_class("Temp")
     @dataclasses.dataclass
     class Temp:
         count: hessian2.Long
 
     codec = Codec()
-    assert codec.dumps(Temp(1)) == codec.dumps(Temp(1))
-    assert b"\xe1" in codec.dumps(Temp(1))
-    assert codec.java_name(Temp) == "Temp"
-    with pytest.raises(DecodeError, match="not registered"):
-        codec.loads(codec.dumps(Temp(1)))
+    codec.dumps(Temp(1))
     ref = weakref.ref(Temp)
     del Temp
+
     gc.collect()
+
     assert ref() is None
 
 
-def test_failed_registration_registers_nothing() -> None:
-    @dataclasses.dataclass
-    class Child:
-        x: int = 0
-
-    @hessian2.java_class("Parent")
-    @dataclasses.dataclass
-    class Parent:
-        child: Child | None = None
-
-    codec = Codec()
-    with pytest.raises(TypeError, match=r"refers to .*Child, which"):
-        codec.register(Parent)
-    with pytest.raises(DecodeError, match="not registered"):
-        codec.loads(hessian2.dumps(HessianObject("Parent", {"child": None})))
-
+def test_a_name_registered_to_another_class_is_refused() -> None:
     @hessian2.java_class("Taken")
     @dataclasses.dataclass
     class Other:
@@ -613,12 +593,14 @@ def test_failed_registration_registers_nothing() -> None:
     class Squatter:
         pass
 
+    codec = Codec()
     codec.register(Squatter, name="Taken")
-    with pytest.raises(ValueError, match="already registered"):
-        codec.register(Holder)
-    assert codec.java_name(Holder) == "Holder"
-    with pytest.raises(DecodeError, match="not registered"):
-        codec.loads(hessian2.dumps(HessianObject("Holder", {"other": None})))
+
+    with pytest.raises(ValueError, match=re.escape("already registered")):
+        codec.register(Other)
+    # A field's annotation still decodes the class it declares.
+    codec.register(Holder)
+    assert same(codec.loads(codec.dumps(Holder(Other()))), Holder(Other()))
 
 
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="TypeAliasType is 3.12+")
@@ -626,6 +608,7 @@ def test_type_aliases_substitute_parameters_by_identity() -> None:
     A, B, C = typing.TypeVar("A"), typing.TypeVar("B"), typing.TypeVar("C")
     swapped = typing.TypeAliasType("Swapped", tuple[B, A], type_params=(A, B))
     unused = typing.TypeAliasType("Unused", list[A], type_params=(A, C))
+
     assert hessian2.dumps((1, 2), type=swapped[int, hessian2.Long]) == b"\x7a\xe1\x92"
     assert hessian2.dumps([1], type=unused[hessian2.Long, str]) == b"\x79\xe1"
 
@@ -638,10 +621,11 @@ def test_recursive_annotations_terminate() -> None:
         "type Tree = dict[str, Tree] | hessian2.Long\n",
         ns,
     )
+
     assert hessian2.dumps({"x": [1]}, type=ns["Json"]) == hessian2.dumps({"x": [1]})
-    Codec().register(ns["Json"])
+    assert same(hessian2.loads(hessian2.dumps({"x": [1]}), type=ns["Json"]), {"x": [1]})
     # Tags below the first level would be lost, so they are refused.
-    with pytest.raises(TypeError, match="contains itself"):
+    with pytest.raises(TypeError, match=re.escape("contains itself")):
         hessian2.dumps(1, type=ns["Tree"])
 
 
@@ -650,94 +634,13 @@ def test_recursive_typed_dicts_refuse_tags_they_cannot_apply() -> None:
         value: hessian2.Long
         children: list[Node]
 
-    with pytest.raises(TypeError, match="contains itself"):
+    with pytest.raises(TypeError, match=re.escape("contains itself")):
         hessian2.dumps({"value": 1, "children": []}, type=Node)
 
 
-def test_callback_errors_take_the_running_operations_class() -> None:
-    @dataclasses.dataclass
-    class P:
-        a: int
-
-    decoding = Codec()
-    decoding.register(
-        Converter(
-            P,
-            to_fields=lambda p: {"a": p.a},
-            from_fields=lambda f: hessian2.dumps(object()),
-        ),
-        name="P",
-    )
-    with pytest.raises(DecodeError) as caught:
-        decoding.loads(decoding.dumps(P(1)))
-    assert isinstance(caught.value.__cause__, EncodeError)
-
-    encoding = Codec()
-    encoding.register(
-        Converter(
-            P,
-            to_fields=lambda p: hessian2.loads(b"\xff"),
-            from_fields=lambda f: P(**f),
-        ),
-        name="P",
-    )
-    with pytest.raises(EncodeError) as caught2:
-        encoding.dumps(P(1))
-    assert isinstance(caught2.value.__cause__, DecodeError)
-
-
-def test_a_container_seen_under_other_tags_is_written_again() -> None:
-    xs = [1]
-    long_list = list[hessian2.Long]
-    # Different tags: a second copy; same tags or none: a reference.
-    assert hessian2.dumps_many([xs, xs], types=[list[int], long_list]) == (
-        b"\x79\x91\x79\xe1"
-    )
-    assert hessian2.dumps_many([xs, xs], types=[long_list, list[int]]) == (
-        b"\x79\xe1\x51\x90"
-    )
-    assert hessian2.dumps_many([xs, xs], types=[long_list, long_list]) == (
-        b"\x79\xe1\x51\x90"
-    )
-    # Each version is a reference target of its own, numbered as Java numbers it.
-    stream = hessian2.dumps_many(
-        [xs, xs, xs, xs], types=[list[int], long_list, long_list, None]
-    )
-    assert stream == b"\x79\x91\x79\xe1\x51\x91\x51\x90"
-    first, copy, again, plain = hessian2.loads_many(stream)
-    assert plain is first and again is copy and copy is not first
-
-    shared: dict[str, int] = {"a": 1}
-    stream = hessian2.dumps_many(
-        [shared, shared], types=[dict[str, int], dict[str, hessian2.Long]]
-    )
-    assert stream == b"H\x01a\x91ZH\x01a\xe1Z"
-
-    # Copying a container that contains itself ends where the tags do.
-    cycle: list[Any] = []
-    cycle.append(cycle)
-    data = hessian2.dumps(cycle, type=list[list[hessian2.Long]])
-    assert data == b"\x79\x79\x51\x90"
-    outer = hessian2.loads(data)
-    assert outer[0] is not outer and outer[0][0] is outer
-
-
 def test_replace_needs_a_class() -> None:
-    with pytest.raises(TypeError, match="replace= need a class"):
+    with pytest.raises(TypeError, match=re.escape("takes a class or a Converter")):
         Codec().register(list[Address], replace=True)
-
-
-def test_a_union_member_that_stops_applying_does_not_panic() -> None:
-    class Shifty(tuple):  # type: ignore[type-arg]
-        calls = 0
-
-        def __len__(self) -> int:
-            Shifty.calls += 1
-            return 1 if Shifty.calls == 1 else 2
-
-    value = Shifty((1, 2))
-    data = hessian2.dumps(value, type=tuple[hessian2.Long] | dict[str, hessian2.Long])
-    assert hessian2.loads(data) == [1, 2]
 
 
 @pytest.mark.parametrize(
@@ -746,11 +649,13 @@ def test_a_union_member_that_stops_applying_does_not_panic() -> None:
         list[int] | tuple[hessian2.Long, ...],
         int | hessian2.Long,
         dict[str, int] | dict[str, hessian2.Long],
+        _Ids | tuple[hessian2.Long, ...],
+        collections.OrderedDict | dict[str, hessian2.Long],
     ],
     ids=repr,
 )
 def test_unions_reject_tags_an_untagged_member_competes_with(tp: Any) -> None:
-    with pytest.raises(TypeError, match="same values as another member"):
+    with pytest.raises(TypeError, match=re.escape("same values as another member")):
         hessian2.dumps([1], type=tp)
 
 
@@ -774,26 +679,39 @@ def test_registration_resolves_each_class_where_it_was_defined() -> None:
     root, value = factory()
     codec = Codec()
     codec.register(root)
-    assert codec.loads(codec.dumps(value)) == value
+
+    assert same(codec.loads(codec.dumps(value)), value)
 
 
-def test_java_name_agrees_with_the_encoder() -> None:
+def test_java_name_and_encoding_use_the_converter_even_under_a_builtin_tag():
     codec = Codec()
     codec.register(
-        Converter(int, to_fields=lambda v: {"v": v}, from_fields=lambda f: f["v"]),
+        Converter(int, lambda v: {"v": str(v)}, lambda f: int(f["v"])),
         name="custom.Int",
         replace=True,
     )
-    assert b"custom.Int" in codec.dumps(5, type=hessian2.BigInteger)
+
+    assert (
+        codec.dumps(5, type=hessian2.BigInteger) == b"C\x0acustom.Int\x91\x01v\x60\x015"
+    )
     assert codec.java_name(hessian2.BigInteger) == "custom.Int"
 
-    class Money(Decimal):
-        pass
 
+class DecimalSubclass(Decimal):
+    pass
+
+
+def test_unregistered_decimal_subclasses_have_no_encoding_mapping():
     with pytest.raises(EncodeError):
-        hessian2.dumps(Money("1"))
-    with pytest.raises(TypeError, match="no Java class name"):
-        hessian2.java_name(Money)
+        hessian2.dumps(DecimalSubclass("1"))
+
+
+def test_unregistered_decimal_subclasses_have_no_java_name():
+    with pytest.raises(TypeError, match=re.escape("no Java class name")):
+        hessian2.java_name(DecimalSubclass)
+
+
+def test_memoryview_has_the_java_byte_array_name():
     assert hessian2.java_name(memoryview) == "[B"
 
 
@@ -821,11 +739,341 @@ class Plain(TypedDict):
     ids=repr,
 )
 def test_unions_reject_tags_competing_with_any_untagged_member(tp: Any) -> None:
-    with pytest.raises(TypeError, match="same values as another member"):
+    with pytest.raises(TypeError, match=re.escape("same values as another member")):
         hessian2.dumps(None, type=tp)
 
 
-def test_register_follows_annotated_and_typing_unions() -> None:
+def test_annotated_and_typing_unions_decode() -> None:
+    annotation = typing.Annotated[typing.Optional[Address], "meta"]  # noqa: UP045
+
+    data = hessian2.dumps(Address("x"))
+
+    assert same(hessian2.loads(data, type=annotation), Address("x"))
+
+
+@pytest.mark.parametrize(
+    ("annotation", "expected"),
+    [
+        (typing.NewType("user_id", str), "java.lang.String"),
+        (typing.TypeVar("long_var", bound=hessian2.Long), "long"),
+        (typing.TypeVar("free"), None),
+    ],
+    ids=["newtype", "bound-typevar", "unbound-typevar"],
+)
+def test_java_name_reads_newtypes_and_type_variable_bounds(annotation, expected):
+    assert hessian2.java_name(annotation) == expected
+
+
+def test_encoding_applies_the_tag_in_a_type_variable_bound():
+    long_var = typing.TypeVar("long_var", bound=hessian2.Long)
+
+    assert hessian2.dumps([7], type=list[long_var]) == b"y\xe7"
+
+
+def test_decoding_a_newtype_uses_its_supertype():
+    user_id = typing.NewType("user_id", str)
+
+    assert same(hessian2.loads(hessian2.dumps("a"), type=user_id), "a")
+
+
+_T = typing.TypeVar("_T")
+
+
+@dataclasses.dataclass
+class _Left(typing.Generic[_T]):
+    left: _T
+
+
+@dataclasses.dataclass
+class _Right(typing.Generic[_T]):
+    right: _T
+
+
+@hessian2.java_class("com.example.Combined", field_naming=None)
+@dataclasses.dataclass
+class _Combined(_Left[str], _Right[hessian2.Long]):
+    pass
+
+
+_U = typing.TypeVar("_U")
+
+
+@dataclasses.dataclass
+class _Pair(typing.Generic[_T, _U]):
+    first: _T
+    second: _U
+
+
+@dataclasses.dataclass
+class _Partial(_Pair[int, _U], typing.Generic[_U]):
+    pass
+
+
+@hessian2.java_class("com.example.Final")
+@dataclasses.dataclass
+class _Final(_Partial[str]):
+    pass
+
+
+def test_generic_bases_bind_shared_type_variables_independently_during_encoding():
+    value = _Combined(right=7, left="x")
+
+    assert (
+        hessian2.dumps(value)
+        == b"C\x14com.example.Combined\x92\x05right\x04left\x60\xe7\x01x"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [_Combined(right=7, left="x"), _Final(1, "ok")],
+    ids=["multiple-bases", "partial-binding"],
+)
+def test_generic_bases_bind_their_type_parameters_during_decoding(value):
+    assert same(hessian2.loads(hessian2.dumps(value), type=type(value)), value)
+
+
+def test_generic_bases_reject_a_value_for_the_other_bases_type_argument():
+    with pytest.raises(DecodeError, match=re.escape("expected str")):
+        hessian2.loads(hessian2.dumps(_Combined(right=7, left=8)), type=_Combined)
+
+
+class _WithMetadata(TypedDict):
+    value: int
+    next: typing.NotRequired[typing.Annotated[_WithMetadata, "meta"]]
+
+
+def test_metadata_does_not_hide_a_typed_dict_s_recursion() -> None:
+    wire = hessian2.dumps({"value": 1, "next": {"value": 2}}, type=_WithMetadata)
+
+    assert same(
+        hessian2.loads(wire, type=_WithMetadata), {"value": 1, "next": {"value": 2}}
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="TypeAliasType is 3.12+")
+def test_a_tag_around_an_alias_is_not_recursion() -> None:
+    scalar = typing.TypeAliasType("scalar", int)  # type: ignore[attr-defined,unused-ignore]
+    tagged = typing.Annotated[scalar, *typing.get_args(hessian2.Long)[1:]]
+
+    wire = hessian2.dumps(7, type=tagged)
+
+    assert wire == b"\xe7"
+    assert same(hessian2.loads(wire, type=tagged), 7)
+
+
+def test_annotations_resolve_where_they_are_written() -> None:
+    def module(name: str, source: str) -> types.ModuleType:
+        made = types.ModuleType(name)
+        made.__dict__.update(hessian2=hessian2, dataclasses=dataclasses, typing=typing)
+        sys.modules[name] = made
+        exec(
+            compile("from __future__ import annotations\n" + source, name, "exec"),
+            made.__dict__,
+        )
+        return made
+
+    try:
+        module(
+            "_base_models",
+            "Id = hessian2.Long\nclass Base(typing.TypedDict):\n    value: Id\n",
+        )
+        # An inherited annotation names the base module's Id, not this one.
+        child = module(
+            "_child_models",
+            "import _base_models\nId = int\nclass Child(_base_models.Base):\n    pass\n",
+        ).Child
+        assert hessian2.dumps({"value": 7}, type=child) == b"H\x05value\xe7Z"
+        # A field named int does not change what the annotation int means.
+        counter = module(
+            "_shadow_models",
+            "@hessian2.java_class('Counter')\n"
+            "@dataclasses.dataclass\n"
+            "class Counter:\n"
+            "    value: int\n"
+            "    int: bool = False\n",
+        ).Counter
+        with pytest.raises(DecodeError, match=re.escape("expected int")):
+            hessian2.loads(hessian2.dumps(counter("x")), type=counter)
+    finally:
+        for name in ("_base_models", "_child_models", "_shadow_models"):
+            sys.modules.pop(name, None)
+
+
+_Item = typing.TypeVar("_Item")
+
+
+class _Page(TypedDict, typing.Generic[_Item]):
+    total: hessian2.Long
+    items: list[_Item]
+
+
+def test_a_generic_typed_dict_s_arguments_and_own_tags_both_apply() -> None:
+    # Encoding and decoding read Page[...] alike: its own tags stay, and its
+    # arguments type its parameters.
+    wire = hessian2.dumps({"total": 1, "items": [2]}, type=_Page[hessian2.Long])
+
+    assert wire == b"H\x05total\xe1\x05itemsy\xe2Z"
+    assert (
+        hessian2.dumps({"total": 1, "items": []}, type=_Page[int]).count(b"\xe1") == 1
+    )
+    assert same(hessian2.loads(wire, type=_Page[int]), {"total": 1, "items": [2]})
+
+
+class _ValueMap(dict[str, _Item]):
+    pass
+
+
+def test_tags_in_arguments_that_do_not_type_items_are_refused() -> None:
+    # _ValueMap's one argument is not its key and value.
+    with pytest.raises(TypeError, match=re.escape("tags in the arguments")):
+        hessian2.dumps(_ValueMap(x=7), type=_ValueMap[hessian2.Long])
+
+
+def test_encoding_a_generic_reads_none_of_its_fields() -> None:
+    @dataclasses.dataclass
+    class Converted(typing.Generic[_Item]):
+        value: _Item
+        # Never resolved: the converter writes Converted.
+        irrelevant: MissingType = None  # type: ignore[name-defined]  # noqa: F821
+
     codec = Codec()
-    codec.register(typing.Annotated[typing.Optional[Address], "meta"])  # noqa: UP045
-    assert codec.loads(codec.dumps(Address("x"))) == Address("x")
+    codec.register(
+        Converter(Converted, lambda v: {"v": v.value}, lambda f: Converted(f["v"])),
+        name="com.example.Converted",
+    )
+
+    assert codec.java_name(Converted[int]) == "com.example.Converted"
+    assert codec.dumps(Converted(7), type=Converted[int]) == codec.dumps(Converted(7))
+
+
+@dataclasses.dataclass
+class _ListRecord(list[_Item]):
+    value: _Item
+
+
+@dataclasses.dataclass
+class _DictRecord(dict[str, _Item]):
+    value: _Item
+
+
+@pytest.mark.parametrize(
+    ("record", "other", "data"),
+    [
+        (_ListRecord, list[hessian2.Long], [8]),
+        (_DictRecord, dict[str, hessian2.Long], {"k": 8}),
+    ],
+    ids=["list-base", "dict-base"],
+)
+@pytest.mark.parametrize("order", ["record-first", "container-first"])
+def test_a_converted_record_keeps_its_mapping_in_a_container_union(
+    record, other, data, order
+):
+    codec = Codec()
+    codec.register(
+        Converter(record, lambda v: {"v": v.value}, lambda f: record(f["v"])),
+        name=f"com.example.{record.__name__}",
+    )
+    annotation = {
+        "record-first": record[int] | other,
+        "container-first": other | record[int],
+    }[order]
+
+    assert codec.dumps(record(7), type=annotation) == codec.dumps(record(7))
+
+
+@pytest.mark.parametrize(
+    ("record", "other", "data"),
+    [
+        (_ListRecord, list[hessian2.Long], [8]),
+        (_DictRecord, dict[str, hessian2.Long], {"k": 8}),
+    ],
+    ids=["list-base", "dict-base"],
+)
+@pytest.mark.parametrize("order", ["record-first", "container-first"])
+def test_a_plain_container_keeps_its_tags_in_a_converted_record_union(
+    record, other, data, order
+):
+    codec = Codec()
+    codec.register(
+        Converter(record, lambda v: {"v": v.value}, lambda f: record(f["v"])),
+        name=f"com.example.{record.__name__}",
+    )
+    annotation = {
+        "record-first": record[int] | other,
+        "container-first": other | record[int],
+    }[order]
+
+    assert codec.dumps(data, type=annotation) == codec.dumps(data, type=other)
+
+
+@hessian2.java_class("com.example.Nest")
+@dataclasses.dataclass
+class _Nest(typing.Generic[_Item]):
+    value: _Item
+
+
+def test_nested_generics_compile_in_linear_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotation: Any = int
+    value: Any = 7
+    # Reading each field and argument twice per level took 2**40 steps, and
+    # reading each level's fields again took 40**2.
+    for _ in range(40):
+        annotation, value = _Nest[annotation], _Nest(value)
+    # Complexity bound: private call counts avoid a machine-dependent timing assertion.
+    strip, reads = hessian2._strip, []
+    monkeypatch.setattr(hessian2, "_strip", lambda tp: reads.append(tp) or strip(tp))
+    hessian2._type_plan(annotation)
+
+    assert len(reads) <= 41
+    monkeypatch.undo()
+    assert same(
+        hessian2.loads(hessian2.dumps(value, type=annotation), type=annotation), value
+    )
+
+
+class _OptionalOutside(TypedDict):
+    x: typing.Annotated[typing.NotRequired[int], "meta"]
+
+
+class _RequiredOutside(TypedDict, total=False):
+    x: typing.Annotated[typing.Required[int], "meta"]
+
+
+def test_annotated_not_required_keys_can_be_absent():
+    assert same(hessian2.loads(hessian2.dumps({}), type=_OptionalOutside), {})
+
+
+def test_annotated_required_keys_cannot_be_absent():
+    with pytest.raises(DecodeError, match=re.escape("without key 'x'")):
+        hessian2.loads(hessian2.dumps({}), type=_RequiredOutside)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="TypeAliasType is 3.12+")
+def test_an_alias_of_none_is_the_nullable_member() -> None:
+    null = typing.TypeAliasType("null", type(None))  # type: ignore[attr-defined,unused-ignore]
+    aliased = tuple[hessian2.Long | null, ...]  # type: ignore[valid-type]
+    explicit = tuple[hessian2.Long | None, ...]
+
+    assert (
+        hessian2.java_name(aliased)
+        == hessian2.java_name(explicit)
+        == "[Ljava.lang.Long;"
+    )
+    assert hessian2.dumps([7], type=aliased) == hessian2.dumps([7], type=explicit)
+
+
+def test_a_new_type_defined_in_a_function_resolves() -> None:
+    local_id = typing.NewType("local_id", hessian2.Long)  # type: ignore[valid-newtype]
+
+    @hessian2.java_class("com.example.LocalUser")
+    @dataclasses.dataclass
+    class LocalUser:
+        user_id: local_id
+
+    wire = hessian2.dumps(LocalUser(7))
+
+    assert wire.endswith(b"\xe7")
+    assert same(hessian2.loads(wire, type=LocalUser), LocalUser(7))

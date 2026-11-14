@@ -14,7 +14,9 @@ mod decode;
 mod encode;
 mod hint;
 mod object;
+mod reader;
 mod time;
+mod typed;
 
 pyo3::create_exception!(
     hessian2,
@@ -65,6 +67,9 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("EncodeError", py.get_type::<EncodeError>())?;
     module.add_class::<codec::Codec>()?;
     module.add_class::<object::HessianObject>()?;
+    module.add_class::<object::Typed>()?;
     module.add_class::<hint::HintObject>()?;
+    module.add_class::<typed::TypeObject>()?;
+    module.add_class::<reader::Reader>()?;
     Ok(())
 }

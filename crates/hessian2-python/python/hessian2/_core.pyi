@@ -22,7 +22,32 @@ class HessianObject:
     __hash__: ClassVar[None]  # type: ignore[assignment]
 
 @final
+class Typed:
+    __match_args__ = ("value", "type")
+    @property
+    def value(self) -> Any: ...
+    @property
+    def type(self) -> Any: ...
+    def __init__(self, value: Any, type: Any) -> None: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
+
+@final
+class Reader:
+    def load(
+        self,
+        *,
+        type: Any = None,
+        unknown_class: Literal["raise", "hessian_object", "dict"] | None = None,
+    ) -> Any: ...
+    def tell(self) -> int: ...
+
+@final
 class _Hint:
+    def __new__(cls, plan: object, /) -> Self: ...
+
+@final
+class _Type:
     def __new__(cls, plan: object, /) -> Self: ...
 
 class _Codec:
@@ -45,6 +70,7 @@ class _Codec:
         /,
         data: ReadableBuffer,
         *,
+        type: Any = None,
         unknown_class: Literal["raise", "hessian_object", "dict"] | None = None,
     ) -> Any: ...
     def loads_many(
@@ -52,20 +78,27 @@ class _Codec:
         /,
         data: ReadableBuffer,
         *,
+        types: Iterable[Any] | None = None,
         unknown_class: Literal["raise", "hessian_object", "dict"] | None = None,
     ) -> list[Any]: ...
+    def reader(self, /, data: ReadableBuffer) -> Reader: ...
+    def as_object(self, obj: Any, /) -> HessianObject | None: ...
     def _registered_name(self, ty: type, /) -> str | None: ...
     @staticmethod
     def _class_entry(
         name: str,
         cls: type,
-        fields: list[tuple[str, str, int, Any, Any]],
+        fields: list[tuple[str, str, int, Any, Any, Any, Any, Any]],
+        new: Callable[..., Any],
         post_init: tuple[str, tuple[Any, ...]] | None,
         /,
     ) -> object: ...
     @staticmethod
     def _tuple_entry(
-        name: str, cls: type, fields: list[tuple[str, str, int, Any, Any]], /
+        name: str,
+        cls: type,
+        fields: list[tuple[str, str, int, Any, Any, Any, Any, Any]],
+        /,
     ) -> object: ...
     @staticmethod
     def _enum_entry(name: str, cls: type, /) -> object: ...

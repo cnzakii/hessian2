@@ -103,7 +103,7 @@ jobs:
         run: |
           make fixtures-java fixtures-go
           git diff --exit-code crates/hessian2-python/tests/fixtures
-      - run: make test-python
+      - run: make test-python-live-java test-python-live-go
 
   required:
     name: Required checks
