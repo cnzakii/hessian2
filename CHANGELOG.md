@@ -4,6 +4,8 @@ User-visible changes to hessian2 are recorded here.
 
 ## Unreleased
 
+## [0.2.0] - 2026-11-14
+
 ### Added
 
 - Python: `@hessian2.java_class(name)` declares a class's Java name on the
