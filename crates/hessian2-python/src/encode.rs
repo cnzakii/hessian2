@@ -3,7 +3,6 @@ use std::collections::HashMap;
 
 use hessian2_core::Writer;
 use pyo3::exceptions::PyOverflowError;
-use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyDict,
@@ -13,9 +12,9 @@ use pyo3::types::{
 
 use crate::address::AddressMap;
 use crate::builtins::{self, Builtin};
-use crate::codec::{Entry, Kind, Registry};
-use crate::hint::Hint;
-use crate::object::HessianObject;
+use crate::codec::{Entry, Field, Kind, Registry, shape_hash};
+use crate::hint::{self, Base, Hint};
+use crate::object::{HessianObject, Typed};
 use crate::{EncodeError, encode_user_error, time};
 
 /// Writes Python values as one Hessian stream, keeping the stream's class
@@ -33,10 +32,16 @@ pub struct Encoder<'a, 'py> {
     /// Keeps every value in `refs` alive so no address is reused while
     /// encoding, as `pickle` does for its memo.
     alive: Vec<Bound<'py, PyAny>>,
-    /// Class indexes of registered classes, by entry address.
-    classes: AddressMap<usize>,
-    /// Class indexes of definitions given as a name and field names.
-    shapes: HashMap<(String, Vec<String>), usize>,
+    /// Every class definition written, with its index, by the `shape_hash`
+    /// of its name and field names: Java writes one definition per class,
+    /// so whatever writes a name and field list again shares it. A
+    /// registered class finds its own definition here by its entry's hash.
+    defined: AddressMap<(usize, Defined)>,
+    /// Definitions whose hash another definition already has.
+    collided: Vec<(usize, Defined)>,
+    /// Class indexes of registered classes whose definition was written for
+    /// something else, or collided, by entry address.
+    aliases: AddressMap<usize>,
     /// Class indexes of built-in forms, by `Builtin` discriminant.
     builtins: [Option<usize>; Builtin::ALL.len()],
     /// Reference numbers of the registered tuples being written, which a
@@ -123,8 +128,9 @@ impl<'a, 'py> Encoder<'a, 'py> {
             refs: SPARE_REFS.take(),
             versions: AddressMap::default(),
             alive: Vec::new(),
-            classes: AddressMap::default(),
-            shapes: HashMap::new(),
+            defined: AddressMap::default(),
+            collided: Vec::new(),
+            aliases: AddressMap::default(),
             builtins: [None; Builtin::ALL.len()],
             open_tuples: Vec::new(),
             max_depth,
@@ -156,7 +162,7 @@ impl<'a, 'py> Encoder<'a, 'py> {
                 .get(&(obj.get_type().as_ptr() as usize))
             && matches!(entry.get().kind, Kind::Converter { .. })
         {
-            return self.registered(obj, entry.get());
+            return self.registered(obj, entry);
         }
         // The common exact types first; everything else is out of line so the
         // recursive frame stays small.
@@ -181,10 +187,10 @@ impl<'a, 'py> Encoder<'a, 'py> {
             .by_type
             .get(&(obj.get_type().as_ptr() as usize))
         {
-            self.registered(obj, entry.get())
+            self.registered(obj, entry)
         } else if let Some(entry) = self.declared.get(&(obj.get_type().as_ptr() as usize)) {
             let entry = entry.clone_ref(self.py);
-            self.registered(obj, entry.get())
+            self.registered(obj, &entry)
         } else {
             self.other(obj)
         }
@@ -209,12 +215,15 @@ impl<'a, 'py> Encoder<'a, 'py> {
     /// the encoder writes them the same way.
     fn applies(obj: &Bound<'py, PyAny>, hint: &Hint) -> bool {
         match hint {
-            Hint::Long | Hint::BigInteger => {
+            Hint::Long | Hint::Int | Hint::BigInteger => {
                 obj.is_instance_of::<PyInt>() && !obj.is_instance_of::<PyBool>()
             }
-            Hint::Instant | Hint::OffsetDateTime | Hint::ZonedDateTime => {
-                obj.is_instance_of::<PyDateTime>()
-            }
+            Hint::Array { .. } => obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>(),
+            Hint::Date
+            | Hint::LocalDateTime
+            | Hint::Instant
+            | Hint::OffsetDateTime
+            | Hint::ZonedDateTime => obj.is_instance_of::<PyDateTime>(),
             Hint::Items(_) => sequence(obj).is_some(),
             Hint::Tuple(items) => {
                 (obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>())
@@ -256,7 +265,23 @@ impl<'a, 'py> Encoder<'a, 'py> {
                 self.writer.write_long(value);
                 Ok(())
             }
+            Hint::Int => {
+                let value: i32 = obj.extract().map_err(|_| {
+                    EncodeError::new_err(format!(
+                        "{} does not fit in a Java int; annotate it hessian2.Long for a long",
+                        obj.repr().map_or_else(|_| "?".into(), |r| r.to_string())
+                    ))
+                })?;
+                self.writer.write_int(value);
+                Ok(())
+            }
+            Hint::Array { depth, base, item } => {
+                let name = format!("{}{}", "[".repeat(*depth), self.array_base(base)?);
+                let items = item.as_deref().map_or(ItemHints::None, ItemHints::Each);
+                self.list(obj, Some(&name), Some(hint), items)
+            }
             Hint::BigInteger => self.big_integer(obj),
+            Hint::Date | Hint::LocalDateTime => self.datetime(obj, hint),
             Hint::Instant | Hint::OffsetDateTime | Hint::ZonedDateTime => {
                 self.java_time(obj.cast::<PyDateTime>()?, hint)
             }
@@ -287,44 +312,33 @@ impl<'a, 'py> Encoder<'a, 'py> {
         // Before the str, int, and tuple checks, as registered types come
         // first: a declared StrEnum or named tuple is an object.
         if let Some(entry) = self.declared_entry(obj)? {
-            return self.registered(obj, entry.get());
+            return self.registered(obj, &entry);
         }
-        if obj.is_instance_of::<PyString>() {
-            self.string(obj)?;
-        } else if obj.is_instance_of::<PyInt>() {
-            self.int(obj)?;
-        } else if obj.is_instance_of::<PyFloat>() {
-            self.float(obj)?;
-        } else if let Ok(bytes) = obj.cast::<PyBytes>() {
-            self.writer.write_binary(bytes.as_bytes());
-        } else if obj.is_instance_of::<PyByteArray>() || obj.is_instance_of::<PyMemoryView>() {
-            let bytes = PyMemoryView::from(obj)?.call_method0("tobytes")?;
-            self.writer
-                .write_binary(bytes.cast::<PyBytes>()?.as_bytes());
-        } else if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
-            self.list(obj, None, None, ItemHints::None)?;
-        } else if obj.is_instance_of::<PySet>() || obj.is_instance_of::<PyFrozenSet>() {
-            self.list(obj, Some(HASH_SET), None, ItemHints::None)?;
-        } else if obj.is_instance_of::<PyDict>() {
-            self.map(obj, None, MapHints::None)?;
-        } else if let Ok(object) = obj.cast::<HessianObject>() {
-            self.generic_object(object)?;
-        } else if let Ok(value) = obj.cast::<PyDateTime>() {
-            match time::to_millis(value)? {
+        let Some(form) = form(obj) else {
+            return Err(no_form(&self.codec, obj));
+        };
+        match form {
+            Form::Str => self.string(obj)?,
+            Form::Int => self.int(obj)?,
+            Form::Float => self.float(obj)?,
+            Form::Bytes => self.writer.write_binary(obj.cast::<PyBytes>()?.as_bytes()),
+            Form::Buffer => {
+                let bytes = PyMemoryView::from(obj)?.call_method0("tobytes")?;
+                self.writer
+                    .write_binary(bytes.cast::<PyBytes>()?.as_bytes());
+            }
+            Form::List => self.list(obj, None, None, ItemHints::None)?,
+            Form::Set => self.list(obj, Some(HASH_SET), None, ItemHints::None)?,
+            Form::Dict => self.map(obj, None, MapHints::None)?,
+            Form::Object => self.generic_object(obj.cast::<HessianObject>()?)?,
+            Form::Typed => self.typed(obj.cast::<Typed>()?)?,
+            Form::DateTime => match time::to_millis(obj.cast::<PyDateTime>()?)? {
                 Some(millis) => self.writer.write_date(millis),
                 None => self.builtin(obj, Builtin::LocalDateTime)?,
-            }
-        } else if obj.is_instance_of::<PyDate>() {
-            self.builtin(obj, Builtin::LocalDate)?;
-        } else if obj.is_instance_of::<PyTime>() {
-            self.builtin(obj, Builtin::LocalTime)?;
-        } else if obj.is_instance_of::<PyDelta>() {
-            self.builtin(obj, Builtin::Duration)?;
-        } else {
-            return Err(EncodeError::new_err(format!(
-                "{} has no Hessian form; register it with the codec",
-                type_name(obj)
-            )));
+            },
+            Form::Date => self.builtin(obj, Builtin::LocalDate)?,
+            Form::Time => self.builtin(obj, Builtin::LocalTime)?,
+            Form::Delta => self.builtin(obj, Builtin::Duration)?,
         }
         Ok(())
     }
@@ -464,28 +478,13 @@ impl<'a, 'py> Encoder<'a, 'py> {
         {
             return Ok(None);
         }
-        // An attribute lookup hits CPython's per-type cache and allocates
-        // nothing when absent, so undeclared classes need no cache of ours.
-        let Some(found) = ty.getattr_opt(intern!(py, "__hessian2__"))? else {
+        // Such as annotations that do not resolve: the class cannot encode.
+        let Some(entry) = crate::codec::declared_entry(&self.codec, &ty)
+            .map_err(|error| encode_user_error(py, error))?
+        else {
             return Ok(None);
         };
-        // Declared on the class itself: a subclass does not inherit it.
-        let own = ty
-            .getattr(intern!(py, "__dict__"))?
-            .call_method1(intern!(py, "get"), (intern!(py, "__hessian2__"),))?;
-        if !own.is(&found) {
-            return Ok(None);
-        }
-        // Built once per class and cached on its declaration.
-        let mut entry = own.getattr(intern!(py, "entry"))?;
-        if entry.is_none() {
-            // Such as annotations that do not resolve: the class cannot encode.
-            entry = self
-                .codec
-                .call_method1(intern!(py, "_declared"), (&ty,))
-                .map_err(|error| encode_user_error(py, error))?;
-        }
-        let entry = entry.cast_into::<Entry>()?.unbind();
+        let entry = entry.unbind();
         self.declared.insert(key, entry.clone_ref(py));
         Ok(Some(entry))
     }
@@ -583,13 +582,55 @@ impl<'a, 'py> Encoder<'a, 'py> {
     /// Returns the class index for a name and field names, defining it on
     /// first use.
     fn shape_class(&mut self, name: &str, fields: Vec<String>) -> usize {
-        let key = (name.to_owned(), fields);
-        if let Some(&class) = self.shapes.get(&key) {
+        let hash = shape_hash(name, &fields);
+        if let Some(class) = self.find_class(hash, name, &fields) {
             return class;
         }
-        let class = self.writer.define_class(name, &key.1);
-        self.shapes.insert(key, class);
+        let class = self.writer.define_class(name, &fields);
+        self.record_class(
+            hash,
+            class,
+            Defined::Shape(Box::new((name.to_owned(), fields))),
+        );
         class
+    }
+
+    /// Returns the index of a class definition already written with `name`
+    /// and `fields`, whose [`shape_hash`] is `hash`.
+    fn find_class<S: AsRef<str>>(&self, hash: u64, name: &str, fields: &[S]) -> Option<usize> {
+        match self.defined.get(&(hash as usize)) {
+            Some((class, known)) if known.is(name, fields) => Some(*class),
+            Some(_) => self
+                .collided
+                .iter()
+                .find(|(_, known)| known.is(name, fields))
+                .map(|&(class, _)| class),
+            None => None,
+        }
+    }
+
+    /// Returns the index of the class definition written for `entry`, if any.
+    fn entry_class(&self, entry: &Py<Entry>) -> Option<usize> {
+        match self.defined.get(&(entry.get().shape as usize)) {
+            Some((class, Defined::Entry(known))) if known.is(entry) => Some(*class),
+            _ => self.aliases.get(&(entry.as_ptr() as usize)).copied(),
+        }
+    }
+
+    /// Records that class definition `class`, whose [`shape_hash`] is
+    /// `hash`, was written for `defined`, and returns whether it is the one
+    /// recorded under that hash.
+    fn record_class(&mut self, hash: u64, class: usize, defined: Defined) -> bool {
+        match self.defined.entry(hash as usize) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((class, defined));
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.collided.push((class, defined));
+                false
+            }
+        }
     }
 
     /// Writes `obj` as an object of class `name` whose fields come from the
@@ -607,10 +648,7 @@ impl<'a, 'py> Encoder<'a, 'py> {
             let mut names = Vec::with_capacity(fields.len());
             values.reserve(fields.len());
             for (key, value) in fields.iter() {
-                let key = key.cast::<PyString>().map_err(|_| {
-                    EncodeError::new_err(format!("field names of {name:?} must be str"))
-                })?;
-                names.push(key.to_str()?.to_owned());
+                names.push(field_name(&key, name)?);
                 values.push(value);
             }
             let class = this.shape_class(name, names);
@@ -622,6 +660,18 @@ impl<'a, 'py> Encoder<'a, 'py> {
         self.nested(|this| values.iter().try_for_each(|value| this.value(value)))
     }
 
+    /// Writes a `Typed` value as a value its annotation describes.
+    #[inline(never)]
+    fn typed(&mut self, typed: &Bound<'py, Typed>) -> PyResult<()> {
+        let typed = typed.get();
+        let annotation = typed.scope.as_ref().unwrap_or(&typed.ty);
+        let hint = hint::lookup(&self.codec, annotation.bind(self.py))?;
+        self.hinted(
+            typed.value.bind(self.py),
+            hint.as_ref().and_then(|h| h.get().0.as_ref()),
+        )
+    }
+
     fn generic_object(&mut self, object: &Bound<'py, HessianObject>) -> PyResult<()> {
         let py = self.py;
         let inner = object.get();
@@ -631,54 +681,50 @@ impl<'a, 'py> Encoder<'a, 'py> {
 
     #[inline(never)]
     /// Writes an instance of a registered type.
-    fn registered(&mut self, obj: &Bound<'py, PyAny>, entry: &Entry) -> PyResult<()> {
-        match &entry.kind {
-            Kind::Converter { encode, .. } => return self.converted(obj, entry, encode),
-            Kind::Value(builtin) => return self.builtin(obj, *builtin),
-            _ => {}
-        }
-        let class = match self.classes.get(&(entry as *const Entry as usize)) {
-            Some(&class) => class,
-            None => self.define_entry(entry),
+    fn registered(&mut self, obj: &Bound<'py, PyAny>, entry: &Py<Entry>) -> PyResult<()> {
+        let class = match self.entry_class(entry) {
+            Some(class) => class,
+            None => match &entry.get().kind {
+                Kind::Converter { encode, .. } => return self.converted(obj, entry.get(), encode),
+                Kind::Value(builtin) => return self.builtin(obj, *builtin),
+                _ => self.define_entry(entry),
+            },
         };
+        let entry = entry.get();
         if self.track(obj, |this| Ok(this.writer.begin_object(class)))? {
             return Ok(());
         }
         self.nested(|this| match &entry.kind {
-            Kind::Class { fields, .. } => fields.iter().try_for_each(|field| {
-                let value = obj
-                    .getattr(field.attr.bind(this.py))
-                    .map_err(|error| encode_user_error(this.py, error))?;
+            Kind::Class { fields, .. } => each_field(obj, fields, |field, value| {
                 this.hinted(&value, field.hint.as_ref())
             }),
             Kind::Tuple { fields } => {
-                let items = obj.cast::<PyTuple>()?;
-                if items.len() != fields.len() {
-                    return Err(EncodeError::new_err(format!(
-                        "{} has {} items, not {}",
-                        type_name(obj),
-                        items.len(),
-                        fields.len()
-                    )));
-                }
                 this.open_tuples.push(this.refs[&(obj.as_ptr() as usize)].0);
-                let result = items
-                    .iter()
-                    .zip(fields)
-                    .try_for_each(|(item, field)| this.hinted(&item, field.hint.as_ref()));
+                let result = each_item(obj, fields, |field, value| {
+                    this.hinted(&value, field.hint.as_ref())
+                });
                 this.open_tuples.pop();
                 result
             }
-            Kind::Enum => this.value(&obj.getattr(pyo3::intern!(this.py, "name"))?),
+            Kind::Enum => this.value(&enum_name(obj)?),
             Kind::Value(_) | Kind::Converter { .. } => unreachable!("handled above"),
         })
     }
 
     #[cold]
     #[inline(never)]
-    fn define_entry(&mut self, entry: &Entry) -> usize {
-        let class = self.writer.define_class(&entry.name, &entry.wire_fields());
-        self.classes.insert(entry as *const Entry as usize, class);
+    fn define_entry(&mut self, entry: &Py<Entry>) -> usize {
+        let inner = entry.get();
+        let fields = inner.wire_fields();
+        if let Some(class) = self.find_class(inner.shape, &inner.name, &fields) {
+            self.aliases.insert(entry.as_ptr() as usize, class);
+            return class;
+        }
+        let class = self.writer.define_class(&inner.name, &fields);
+        let defined = Defined::Entry(entry.clone_ref(self.py));
+        if !self.record_class(inner.shape, class, defined) {
+            self.aliases.insert(entry.as_ptr() as usize, class);
+        }
         class
     }
 
@@ -748,6 +794,51 @@ impl<'a, 'py> Encoder<'a, 'py> {
             mag.into_iter().for_each(|word| w.write_int(word));
             Ok(())
         })
+    }
+
+    /// Returns the component type name of an array hint: a class's as this
+    /// codec's registration names it, as `java_name` does, else its given
+    /// name, or `object` for a class it cannot encode, whose items fail on
+    /// their own.
+    fn array_base(&mut self, base: &Base) -> PyResult<String> {
+        let (class, name) = match base {
+            Base::Name(name) => return Ok(name.clone()),
+            Base::Class(class, name) => (class.bind(self.py), name),
+        };
+        if let Some(registered) = self.registry.registered_name(class) {
+            return Ok(registered.to_owned());
+        }
+        if let Some(name) = name {
+            return Ok(name.clone());
+        }
+        let declared = crate::codec::declared_entry(&self.codec, class)
+            .map_err(|error| encode_user_error(self.py, error))?;
+        Ok(declared.map_or_else(|| "object".to_owned(), |entry| entry.get().name.clone()))
+    }
+
+    /// Writes a `datetime` as its default form, which the `Date` or
+    /// `LocalDateTime` hint requires to be that Java type.
+    ///
+    /// # Errors
+    ///
+    /// Raises `EncodeError` for a naive `datetime` as a `Date`, and an aware
+    /// one as a `LocalDateTime`.
+    #[inline(never)]
+    fn datetime(&mut self, obj: &Bound<'py, PyAny>, hint: &Hint) -> PyResult<()> {
+        let millis = time::to_millis(obj.cast::<PyDateTime>()?)?;
+        match (hint, millis) {
+            (Hint::Date, Some(millis)) => {
+                self.writer.write_date(millis);
+                Ok(())
+            }
+            (Hint::Date, None) => Err(EncodeError::new_err(
+                "a naive datetime has no java.util.Date form; give it a tzinfo",
+            )),
+            (_, None) => self.builtin(obj, Builtin::LocalDateTime),
+            (_, Some(_)) => Err(EncodeError::new_err(
+                "an aware datetime has no java.time.LocalDateTime form; use a naive datetime",
+            )),
+        }
     }
 
     /// Writes an aware `datetime` in hessian-lite's handle form for the
@@ -829,11 +920,21 @@ impl<'a, 'py> Encoder<'a, 'py> {
 
     /// Returns the class index of a built-in form, defining it on first use.
     fn builtin_class(&mut self, builtin: Builtin) -> usize {
-        let slot = &mut self.builtins[builtin as usize];
-        *slot.get_or_insert_with(|| {
-            self.writer
-                .define_class(builtin.names()[0], builtin.wire_fields())
-        })
+        if let Some(class) = self.builtins[builtin as usize] {
+            return class;
+        }
+        let (name, fields) = (builtin.names()[0], builtin.wire_fields());
+        let hash = shape_hash(name, fields);
+        let class = match self.find_class(hash, name, fields) {
+            Some(class) => class,
+            None => {
+                let class = self.writer.define_class(name, fields);
+                self.record_class(hash, class, Defined::Builtin(builtin));
+                class
+            }
+        };
+        self.builtins[builtin as usize] = Some(class);
+        class
     }
 
     /// Writes the fields of a `LocalDateHandle`.
@@ -859,22 +960,229 @@ impl<'a, 'py> Encoder<'a, 'py> {
         entry: &Entry,
         encode: &Py<PyAny>,
     ) -> PyResult<()> {
-        let py = self.py;
-        let fields = || {
-            encode
-                .bind(py)
-                .call1((obj,))
-                .map_err(|error| encode_user_error(py, error))?
-                .cast_into::<PyDict>()
-                .map_err(|_| {
-                    EncodeError::new_err(format!(
-                        "converter for {:?} must return a dict",
-                        entry.name
-                    ))
-                })
-        };
-        self.fields_object(obj, &entry.name, fields)
+        self.fields_object(obj, &entry.name, || converter_fields(obj, entry, encode))
     }
+}
+
+/// Returns the fields a converter's `to_fields` gives for `obj`.
+fn converter_fields<'py>(
+    obj: &Bound<'py, PyAny>,
+    entry: &Entry,
+    encode: &Py<PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let py = obj.py();
+    encode
+        .bind(py)
+        .call1((obj,))
+        .map_err(|error| encode_user_error(py, error))?
+        .cast_into::<PyDict>()
+        .map_err(|_| {
+            EncodeError::new_err(format!("converter for {:?} must return a dict", entry.name))
+        })
+}
+
+/// What a class definition in a stream was written for, to compare with
+/// another that may share it.
+enum Defined {
+    Entry(Py<Entry>),
+    // Boxed: the table holds every definition, mostly entries.
+    Shape(Box<(String, Vec<String>)>),
+    Builtin(Builtin),
+}
+
+impl Defined {
+    /// Returns whether this definition has `name` and `fields`.
+    fn is<S: AsRef<str>>(&self, name: &str, fields: &[S]) -> bool {
+        let fields = fields.iter().map(AsRef::as_ref);
+        match self {
+            Self::Entry(entry) => {
+                let entry = entry.get();
+                entry.name == name && entry.wire_fields().into_iter().eq(fields)
+            }
+            Self::Shape(shape) => shape.0 == name && shape.1.iter().map(String::as_str).eq(fields),
+            Self::Builtin(builtin) => {
+                builtin.names()[0] == name && builtin.wire_fields().iter().copied().eq(fields)
+            }
+        }
+    }
+}
+
+/// The error for a value with no Hessian form.
+fn no_form(codec: &Bound<'_, PyAny>, obj: &Bound<'_, PyAny>) -> PyErr {
+    match crate::codec::advice(codec, &obj.get_type()) {
+        Ok(advice) => EncodeError::new_err(format!(
+            "{} has no Hessian form{}",
+            type_name(obj),
+            advice.map_or_else(String::new, |advice| format!("; {advice}"))
+        )),
+        Err(error) => error,
+    }
+}
+
+/// How the encoder writes a value without a class entry.
+#[derive(Clone, Copy)]
+enum Form {
+    Str,
+    Int,
+    Float,
+    Bytes,
+    Buffer,
+    List,
+    Set,
+    Dict,
+    Object,
+    Typed,
+    DateTime,
+    Date,
+    Time,
+    Delta,
+}
+
+/// Returns how the encoder writes `obj`, an instance of no registered or
+/// declared class other than `None`, or `None` when it has no Hessian form.
+/// Subclasses too, in this order: a `bool` is an `int`, a `datetime` a `date`.
+fn form(obj: &Bound<'_, PyAny>) -> Option<Form> {
+    Some(if obj.is_instance_of::<PyString>() {
+        Form::Str
+    } else if obj.is_instance_of::<PyInt>() {
+        Form::Int
+    } else if obj.is_instance_of::<PyFloat>() {
+        Form::Float
+    } else if obj.is_instance_of::<PyBytes>() {
+        Form::Bytes
+    } else if obj.is_instance_of::<PyByteArray>() || obj.is_instance_of::<PyMemoryView>() {
+        Form::Buffer
+    } else if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
+        Form::List
+    } else if obj.is_instance_of::<PySet>() || obj.is_instance_of::<PyFrozenSet>() {
+        Form::Set
+    } else if obj.is_instance_of::<PyDict>() {
+        Form::Dict
+    } else if obj.is_instance_of::<HessianObject>() {
+        Form::Object
+    } else if obj.is_instance_of::<Typed>() {
+        Form::Typed
+    } else if obj.is_instance_of::<PyDateTime>() {
+        Form::DateTime
+    } else if obj.is_instance_of::<PyDate>() {
+        Form::Date
+    } else if obj.is_instance_of::<PyTime>() {
+        Form::Time
+    } else if obj.is_instance_of::<PyDelta>() {
+        Form::Delta
+    } else {
+        return None;
+    })
+}
+
+/// Calls `each` with every field of `obj`, an instance of a class with
+/// `fields`, and the field's value, in wire order.
+fn each_field<'py>(
+    obj: &Bound<'py, PyAny>,
+    fields: &[Field],
+    mut each: impl FnMut(&Field, Bound<'py, PyAny>) -> PyResult<()>,
+) -> PyResult<()> {
+    let py = obj.py();
+    fields.iter().try_for_each(|field| {
+        let value = obj
+            .getattr(field.attr.bind(py))
+            .map_err(|error| encode_user_error(py, error))?;
+        each(field, value)
+    })
+}
+
+/// As [`each_field`], for a named tuple, whose items are its fields.
+fn each_item<'py>(
+    obj: &Bound<'py, PyAny>,
+    fields: &[Field],
+    mut each: impl FnMut(&Field, Bound<'py, PyAny>) -> PyResult<()>,
+) -> PyResult<()> {
+    let items = obj.cast::<PyTuple>()?;
+    if items.len() != fields.len() {
+        return Err(EncodeError::new_err(format!(
+            "{} has {} items, not {}",
+            type_name(obj),
+            items.len(),
+            fields.len()
+        )));
+    }
+    items
+        .iter()
+        .zip(fields)
+        .try_for_each(|(item, field)| each(field, item))
+}
+
+/// The value an enum member is written with: its name.
+fn enum_name<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    obj.getattr(pyo3::intern!(obj.py(), "name"))
+}
+
+/// Returns the object `Encoder::value` writes `obj` as, one level deep, for
+/// `Codec.as_object`: its class name and fields, each value a `Typed` with
+/// the field's annotation where the annotation gives it a hint.
+pub fn as_object(
+    codec: &Bound<'_, PyAny>,
+    registry: &Registry,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let py = obj.py();
+    let ty = obj.get_type();
+    // As `Encoder::value` finds an entry: registration, then declaration.
+    let entry = match registry.by_type.get(&(ty.as_ptr() as usize)) {
+        Some(entry) => entry.bind(py).clone(),
+        None => match crate::codec::declared_entry(codec, &ty)
+            .map_err(|error| encode_user_error(py, error))?
+        {
+            Some(entry) => entry,
+            None if obj.is_instance_of::<HessianObject>() => return Ok(Some(obj.clone().unbind())),
+            None if obj.is_none() || form(obj).is_some() => return Ok(None),
+            None => return Err(no_form(codec, obj)),
+        },
+    };
+    let entry = entry.get();
+    let fields = PyDict::new(py);
+    let mut add = |field: &Field, value: Bound<'_, PyAny>| -> PyResult<()> {
+        let value = match &field.annotation {
+            // A `Typed` value applies its own annotation, as in `dumps`.
+            Some(annotation) if !value.is_instance_of::<Typed>() => Py::new(
+                py,
+                Typed {
+                    value: value.unbind(),
+                    ty: annotation.clone_ref(py),
+                    scope: field.scope.as_ref().map(|scope| scope.clone_ref(py)),
+                },
+            )?
+            .into_any(),
+            _ => value.unbind(),
+        };
+        fields.set_item(&field.wire, value)
+    };
+    match &entry.kind {
+        Kind::Value(_) => return Ok(None),
+        Kind::Class { fields, .. } => each_field(obj, fields, &mut add)?,
+        Kind::Tuple { fields } => each_item(obj, fields, &mut add)?,
+        Kind::Enum => fields.set_item(pyo3::intern!(py, "name"), enum_name(obj)?)?,
+        Kind::Converter { encode, .. } => {
+            for (key, value) in converter_fields(obj, entry, encode)?.iter() {
+                field_name(&key, &entry.name)?;
+                fields.set_item(key, value)?;
+            }
+        }
+    }
+    let object = HessianObject {
+        class_name: PyString::new(py, &entry.name).unbind(),
+        fields: fields.unbind(),
+    };
+    Ok(Some(Py::new(py, object)?.into_any()))
+}
+
+/// Returns a converter's or `HessianObject`'s field name `key`, which must
+/// be a `str` that encodes, for a class named `class`.
+fn field_name(key: &Bound<'_, PyAny>, class: &str) -> PyResult<String> {
+    let key = key
+        .cast::<PyString>()
+        .map_err(|_| EncodeError::new_err(format!("field names of {class:?} must be str")))?;
+    Ok(key.to_str()?.to_owned())
 }
 
 /// Returns, for a list, tuple, or set that hints apply to, the class name to

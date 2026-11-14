@@ -1,0 +1,4 @@
+interface:
+  display_name: "hessian2 Testing"
+  short_description: "Write and judge hessian2 tests that state real claims"
+  default_prompt: "Use $hessian2-testing to write or review tests for this hessian2 behavior."

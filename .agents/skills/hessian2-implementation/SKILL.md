@@ -26,8 +26,8 @@ the repository boundaries in `AGENTS.md`.
    contract changes.
    Treat the README, runnable examples, and `docs/site` as coordinated public
    entry points, and reuse canonical content instead of maintaining copies.
-6. Add the smallest check that would fail for a changed behavior. Match evidence
-   to the claim: focused tests for behavior, interoperability for real peers,
+6. Add the smallest check that would fail for a changed behavior, as
+   `hessian2-testing` describes. Match evidence to the claim: focused tests for behavior, interoperability for real peers,
    fuzzing for hostile input/state exploration, and benchmarks for performance.
 7. Run focused checks first, then the broader gate required by `AGENTS.md`.
    Read fresh output before claiming success.

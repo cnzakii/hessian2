@@ -53,7 +53,7 @@ Install JDK 17 and Go to regenerate and check the pinned peers:
 
 ```console
 make fixtures-java fixtures-go
-make test-python
+make test-python-live-java test-python-live-go
 ```
 
 Set `JAVA_HOME` if Java is not on PATH. Inspect fixture diffs; do not update

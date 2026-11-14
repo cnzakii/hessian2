@@ -25,16 +25,27 @@ No response-time or supported service-level commitment is implied.
 ## Security boundary
 
 - Unknown class names never cause imports. Only built-in mappings and
-  classes/callbacks registered with the decoding Codec can be constructed.
-  `@java_class` alone allows encoding, not decoding.
-- Registration is a trust decision. `Codec.register` also registers the
-  declared classes that the registered type's field annotations refer to,
-  so registering a class trusts those too. Descriptors, default factories,
-  post-init hooks, Converter callbacks, and custom map-key hashing/equality
-  can run application code during decoding. Type annotations do not validate
-  incoming field values.
+  classes the application trusts can be constructed: the classes an
+  annotation names at that position, through `type=` and field annotations,
+  and the classes and converters registered with the decoding Codec.
+  `@java_class` alone names a class; decoding trusts it only where an
+  annotation names it.
+- Annotations and registration are trust decisions. Descriptors, default
+  factories, post-init hooks, Converter callbacks, an enum's `_missing_`,
+  and custom map-key hashing/equality can run application code during
+  decoding. Values application code changes are not checked again. Fields a class
+  does not have, keys a TypedDict does not declare, and the fields of JDK
+  values decode as plain data that builds no class. Annotations check the types of incoming values, not
+  other constraints.
 - Input lengths and references are checked. `max_depth` bounds nesting,
-  not total allocations or CPU time; increasing it increases stack usage.
+  not total allocations or CPU time. Each level takes about 1 KiB of
+  thread stack, so the default of 256 needs about 300 KiB, more than
+  musl's default thread stack; increasing it increases stack usage.
+- A map key no annotation types must be one whose hash a peer cannot make
+  collide with many others, which would make decoding quadratic: a
+  string, bytes, bool, `None`, float, 64-bit int, date or time, or enum
+  member. Annotating other key types, such as `dict[UUID, str]`, accepts
+  that cost.
 - Limit message sizes before reading untrusted messages into memory. Large
   flat containers and expensive user-defined keys are not bounded by depth.
 - A shared Codec does not make user callbacks or mutable input objects

@@ -2,8 +2,8 @@
 //! (<http://hessian.caucho.com/doc/hessian-serialization.html>), by figure.
 //!
 //! Examples the specification gets wrong are tested in their corrected form,
-//! with the correction noted at each test; scalar examples are also covered
-//! by the unit tests in `lib.rs`.
+//! with the correction noted at each test. Scalar boundary tables live in
+//! the corresponding topic modules.
 
 use hessian2_core::{Reader, Token, Writer};
 
@@ -68,7 +68,7 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
 
 /// §4.1.2 Figure 3, with the non-final chunk tag the bytecode map gives (`A`).
 #[test]
-fn figure_3_binary() {
+fn spec_binary_chunks_join_into_one_value() {
     assert_eq!(render(&[0x20]), "bin(0)");
     assert_eq!(render(&[0x23, 1, 2, 3]), "bin(3)");
     let final_chunk = concat(&[b"B\x10\x00", &[0; 0x1000]]);
@@ -79,13 +79,13 @@ fn figure_3_binary() {
 
 /// §4.2.1 Figure 5.
 #[test]
-fn figure_5_boolean() {
+fn spec_boolean_tags_decode_as_distinct_values() {
     assert_eq!(render(b"TF"), "T F");
 }
 
 /// §4.4.6 Figure 10.
 #[test]
-fn figure_10_double() {
+fn spec_doubles_accept_compact_and_full_forms() {
     assert_eq!(
         render(b"\x5b\x5c\x5d\x00\x5d\x80\x5d\x7f\x5e\x00\x00\x5e\x80\x00\x5e\x7f\xff"),
         "0.0D 1.0D 0.0D -128.0D 127.0D 0.0D -32768.0D 32767.0D"
@@ -95,7 +95,7 @@ fn figure_10_double() {
 
 /// §4.6.2 Figures 14, 15, and 16.
 #[test]
-fn figures_14_to_16_lists() {
+fn spec_lists_accept_variable_lengths_and_reused_types() {
     assert_eq!(render(b"V\x04[int\x92\x90\x91"), "[[int:0, 1]");
     assert_eq!(render(b"\x57\x90\x91Z"), "[0, 1]");
     assert_eq!(
@@ -106,7 +106,7 @@ fn figures_14_to_16_lists() {
 
 /// §4.8.1 Figures 20 and 21.
 #[test]
-fn figures_20_and_21_maps() {
+fn spec_maps_accept_typed_and_untyped_forms() {
     assert_eq!(
         render(b"H\x91\x03fee\xa0\x03fie\xc9\x00\x03foeZ"),
         r#"{1="fee", 16="fie", 256="foe"}"#
@@ -123,7 +123,7 @@ fn figures_20_and_21_maps() {
 
 /// §4.10.3 Figure 24.
 #[test]
-fn figure_24_objects() {
+fn spec_objects_reuse_their_class_definition() {
     let bytes =
         b"C\x0bexample.Car\x92\x05color\x05modelO\x90\x03red\x08corvette\x60\x05green\x05civic";
     assert_eq!(
@@ -134,7 +134,7 @@ fn figure_24_objects() {
 
 /// §4.10.3 Figure 25, without the stray `x90` in the second object.
 #[test]
-fn figure_25_enum() {
+fn spec_enum_objects_can_be_back_referenced() {
     let bytes = b"C\x0dexample.Color\x91\x04name\x60\x03RED\x60\x05GREEN\x60\x04BLUE\x51\x91";
     assert_eq!(
         render(bytes),
@@ -144,14 +144,14 @@ fn figure_25_enum() {
 
 /// §4.11.1 Figure 27, with the Hessian 2.0 object tag `O` instead of `o`.
 #[test]
-fn figure_27_circular_list() {
+fn spec_objects_can_reference_themselves() {
     let bytes = b"C\x0aLinkedList\x92\x04head\x04tailO\x90\x91\x51\x90";
     assert_eq!(render(bytes), "LinkedList(head=1, tail=@0)");
 }
 
 /// §4.12.2 Figure 29.
 #[test]
-fn figure_29_strings() {
+fn spec_string_chunks_join_into_one_value() {
     assert_eq!(
         render(b"\x00\x05hello\x01\xc3\x83S\x00\x05hello"),
         r#""" "hello" "Ã" "hello""#
@@ -161,7 +161,7 @@ fn figure_29_strings() {
 
 /// The writer produces the specification's forms for the examples above.
 #[test]
-fn writer_matches_examples() {
+fn writer_matches_the_specification_object_example() {
     let mut w = Writer::new();
     let class = w.define_class("example.Car", &["color", "model"]);
     for (color, model) in [("red", "corvette"), ("green", "civic")] {
@@ -174,7 +174,10 @@ fn writer_matches_examples() {
         w.as_bytes(),
         b"C\x0bexample.Car\x92\x05color\x05model\x60\x03red\x08corvette\x60\x05green\x05civic"
     );
+}
 
+#[test]
+fn writer_matches_the_specification_list_example() {
     let mut w = Writer::new();
     w.begin_list(2, Some("[int"));
     w.write_int(0);
@@ -182,7 +185,10 @@ fn writer_matches_examples() {
     w.begin_list(3, Some("[int"));
     (2..5).for_each(|n| w.write_int(n));
     assert_eq!(w.as_bytes(), b"\x72\x04[int\x90\x91\x73\x90\x92\x93\x94");
+}
 
+#[test]
+fn writer_matches_the_specification_map_example() {
     let mut w = Writer::new();
     w.begin_map(None);
     for (key, value) in [(1, "fee"), (16, "fie"), (256, "foe")] {

@@ -49,6 +49,24 @@ pub enum Token<'a> {
     Ref(usize),
 }
 
+/// A reader's position and stream tables, detached from its input so that
+/// reading the same input can resume later, as Java's `Hessian2Input`
+/// continues across `readObject` calls.
+#[derive(Debug, Default)]
+pub struct ReaderState {
+    pos: usize,
+    classes: Vec<ClassDef>,
+    types: Vec<String>,
+    started: usize,
+}
+
+impl ReaderState {
+    /// Returns the offset of the next unread byte.
+    pub fn offset(&self) -> usize {
+        self.pos
+    }
+}
+
 /// A pull reader over one Hessian 2.0 byte stream.
 ///
 /// Class definitions, type names, and reference numbering persist across
@@ -70,6 +88,31 @@ impl<'a> Reader<'a> {
             classes: Vec::new(),
             types: Vec::new(),
             started: 0,
+        }
+    }
+
+    /// Returns a reader over `input` that continues where `state` left off.
+    ///
+    /// `state` must come from [`Reader::into_state`] on a reader over the
+    /// same input; for other input, reading fails or reads nonsense.
+    pub fn resume(input: &'a [u8], state: ReaderState) -> Self {
+        Self {
+            input,
+            pos: state.pos,
+            classes: state.classes,
+            types: state.types,
+            started: state.started,
+        }
+    }
+
+    /// Returns the reader's position and stream tables, for
+    /// [`Reader::resume`].
+    pub fn into_state(self) -> ReaderState {
+        ReaderState {
+            pos: self.pos,
+            classes: self.classes,
+            types: self.types,
+            started: self.started,
         }
     }
 

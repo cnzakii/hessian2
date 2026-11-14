@@ -3,6 +3,8 @@
 //	write OUT.json   every case as Go's bytes and a structural description
 //	describe DIR     decodes each DIR/NAME.bin and prints
 //	                 {NAME: {"values": [description]} or {"error": message}}
+//	types DIR        decodes each DIR/NAME.bin and prints {NAME: Go type},
+//	                 such as "[]hessian.Object", or {NAME: {"error": message}}
 //
 // Descriptions match interop/java and the Python tests' describe.py, except
 // that maps compare without order and references are not tracked.
@@ -92,6 +94,8 @@ func main() {
 		err = write(os.Args[2])
 	case "describe":
 		err = describeDir(os.Args[2])
+	case "types":
+		err = typesDir(os.Args[2])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -118,6 +122,35 @@ func write(out string) error {
 		return err
 	}
 	return os.WriteFile(out, append(data, '\n'), 0o644)
+}
+
+// typesDir prints the Go type each value decodes as, which Go code that
+// type-asserts decoded values depends on.
+func typesDir(dir string) error {
+	files, err := filepath.Glob(filepath.Join(dir, "*.bin"))
+	if err != nil {
+		return err
+	}
+	result := map[string]interface{}{}
+	for _, file := range files {
+		name := strings.TrimSuffix(filepath.Base(file), ".bin")
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		value, err := hessian.NewDecoder(data).Decode()
+		if err != nil {
+			result[name] = map[string]interface{}{"error": err.Error()}
+			continue
+		}
+		result[name] = reflect.TypeOf(value).String()
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	return nil
 }
 
 func describeDir(dir string) error {

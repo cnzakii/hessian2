@@ -14,8 +14,8 @@ Review the current artifact independently and remain read-only.
 2. Inspect current checkout facts instead of trusting historical reports or the
    implementation author's conclusion.
 3. Select only relevant lenses: wire compatibility, state/data ownership,
-   Python/Rust boundaries, public API usability, resource safety, tests,
-   packaging, naming, or maintenance cost.
+   Python/Rust boundaries, public API usability, resource safety, tests
+   (judged by `hessian2-testing`), packaging, naming, or maintenance cost.
 4. Use `hessian2-knowledge` when a finding depends on an external fact. Treat
    the Hessian specification, the Caucho reference implementation, other pinned
    implementations, official guidance, and engineering judgment as different

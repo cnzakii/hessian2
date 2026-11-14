@@ -65,6 +65,7 @@ make check
 - Use `hessian2-implementation` for changes to code, tests, packaging, CI, or
   project documentation.
 - Use `hessian2-audit` for read-only review after implementation or on request.
+- Use `hessian2-testing` to write, rewrite, or review tests.
 - Use `hessian2-knowledge` for source-based factual research and explicitly
   requested maintenance of `docs/knowledge`.
 
