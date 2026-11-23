@@ -1,5 +1,9 @@
 # hessian2 Repository Guidance
 
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first: its setup, checks,
+interoperability rules, code conventions, and test rules apply to every
+change. This file adds what an agent needs beyond them.
+
 ## Product Boundary
 
 - `hessian2` maps Hessian 2.0 serialization bytes to Python objects and back,
@@ -13,61 +17,28 @@
 
 - `crates/hessian2-core`: Rust pull reader, writer, and string transcoding;
   independent of PyO3.
-- `crates/hessian2-python`: PyO3 extension, Python package, stubs, and tests.
-- `docs/knowledge`: source-based facts about the Hessian wire format and its
-  implementations, not project decisions.
-- `.agents/skills`: project workflows for implementation, audit, and
-  knowledge work.
+- `crates/hessian2-python`: PyO3 extension, Python package, stubs, and tests;
+  golden bytes from Java and Go peers live in `tests/fixtures`.
+- `interop/java`, `interop/go`: the pinned peers that regenerate those
+  fixtures and run the live interoperability tests.
+- `benchmarks`: Python, Java, and Go performance comparisons.
+- `fuzz`: cargo-fuzz targets for the core reader and writer.
 
-## Development
-
-Install locked development dependencies with:
-
-```console
-uv sync --locked
-```
-
-Use focused checks while iterating:
-
-```console
-make lint
-make test-rust
-make test-python
-```
-
-Run the complete local gate before submitting a pull request:
-
-```console
-make check
-```
-
-## Change Rules
+## Working Rules
 
 - Read the affected implementation, callers, tests, exports, stubs, and
-  configuration before editing.
-- Keep wire parsing, encoding forms, and per-stream tables in the Rust core.
-  Keep Python inputs, outputs, and errors natural for Python.
-- Interoperability decides wire behavior, and Java is the authority: write
-  what Caucho's reference implementation and hessian-lite write, and accept
-  whatever the specification allows or Java peers actually send, whichever is
-  looser. Where the specification contradicts itself, follow Java.
-- Follow mainstream Python serialization libraries for API shape and
-  edge-case behavior.
-- Update runtime exports, type stubs, and tests together when the Python API
-  changes.
-- Prefer direct code and existing dependencies over speculative abstractions,
-  compatibility layers, or new tooling.
+  configuration before editing. Update runtime exports, type stubs, and tests
+  together when the Python API changes.
+- Establish the requested outcome and its non-goals before adding files,
+  options, or abstractions.
+- Stop and ask before a change CONTRIBUTING.md says to discuss first: new
+  public API, a dependency, or a substantial design change.
+- Use `make lint`, `make test-rust`, or `make test-python` while iterating,
+  then run `make check`.
+- Report exactly which checks ran and their results. Never claim that a check
+  passed without running it.
 - Keep generated artifacts, build output, local environments, editor state,
-  and personal instructions out of version control.
+  reports, and personal instructions out of version control.
 
-## Project Skills
-
-- Use `hessian2-implementation` for changes to code, tests, packaging, CI, or
-  project documentation.
-- Use `hessian2-audit` for read-only review after implementation or on request.
-- Use `hessian2-testing` to write, rewrite, or review tests.
-- Use `hessian2-knowledge` for source-based factual research and explicitly
-  requested maintenance of `docs/knowledge`.
-
-Work is complete only after the relevant focused checks and required aggregate
-gate finish successfully, followed by a read-only audit of the final changes.
+Work is complete only after the relevant focused checks and `make check` pass,
+followed by a read-only review of the final diff.

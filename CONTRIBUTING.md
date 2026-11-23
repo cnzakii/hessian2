@@ -45,9 +45,13 @@ installation and import tests are required, not just a successful build.
 
 ## Interoperability
 
-Java determines the wire forms we write. Readers accept the specification
-and forms real Java peers send. Changes must preserve reference numbering,
-class/type tables, UTF-16 string lengths, and error handling.
+Interoperability decides wire behavior, and Java is the authority. Write what
+Caucho's reference implementation and hessian-lite write. Read whatever the
+[specification](http://hessian.caucho.com/doc/hessian-serialization.html)
+allows or Java peers actually send, whichever is looser. Where the
+specification contradicts itself, follow Java. Changes must preserve
+reference numbering, class/type tables, UTF-16 string lengths, and error
+handling.
 
 Install JDK 17 and Go to regenerate and check the pinned peers:
 
@@ -60,11 +64,105 @@ Set `JAVA_HOME` if Java is not on PATH. Inspect fixture diffs; do not update
 expected output just to make a test pass. Add the smallest case reproducing
 a bug, and distinguish peer differences from bugs in this library.
 
+## Code conventions
+
+### Boundaries
+
+- Wire parsing, encoding forms, and per-stream tables live in the Rust core,
+  which does not depend on PyO3. The binding maps Python values and keeps
+  inputs, outputs, and errors natural for Python.
+- Follow mainstream Python serialization libraries, such as `pickle`, `json`,
+  and msgspec, for API shape and edge-case behavior.
+- Validate once, where data enters: the peer's bytes and the arguments of
+  public functions. Application code a caller registers (converters,
+  post-init methods, default factories) is trusted.
+- Before 1.0, replace an incorrect design directly, without aliases, shims,
+  or compatibility layers.
+- Prefer direct code, the standard library, and existing dependencies over
+  speculative abstractions or new tooling.
+- Both crates forbid unsafe code. Do not bypass input checks for speed.
+
+### Docstrings and comments
+
+- Python docstrings follow [PEP 257](https://peps.python.org/pep-0257/): a
+  one-line summary in the imperative mood ("Return the …"), then
+  [Google-style](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)
+  `Args:`, `Returns:`, and `Raises:` sections where they add information.
+  Document accepted values, results, errors, and thread safety, and keep
+  `_core.pyi` consistent with the runtime docstrings.
+- Rust doc comments follow
+  [rustdoc](https://doc.rust-lang.org/rustdoc/how-to-write-documentation.html)
+  and the [API Guidelines](https://rust-lang.github.io/api-guidelines/documentation.html):
+  a summary sentence in the third person ("Returns the …"), with `# Errors`,
+  `# Panics`, and `# Safety` sections where they apply. A module's `//!`
+  comment says what the module owns.
+- Inline comments explain why: a constraint, a peer's behavior, or a choice
+  the code cannot show. Name peer behavior concretely ("Caucho writes …",
+  "hessian-lite reads …"), with the version when it matters, and cite
+  external sources by URL at a pinned version.
+- No commented-out code, unexplained TODOs, or history; history belongs in
+  commit messages.
+- `make lint` runs rustfmt, Clippy, Ruff, and ty; their output is the style.
+
+## Tests
+
+A test states one claim about a contract and fails when that claim breaks.
+
+### What to test
+
+- Start from a contract the code owns: the Hessian 2.0 wire format, what
+  Caucho or hessian-lite write and read, a public docstring, the type
+  mapping, or an error a caller can act on.
+- Name the plausible wrong implementation the test would catch. If no
+  realistic bug fails it, do not write it. Do not test constants, types,
+  annotation spelling, or the behavior of Python, PyO3, or the standard
+  library.
+- Encoding claims are exact bytes: what Caucho or hessian-lite write for that
+  value. Decoding claims cover every form the specification allows or Java
+  peers send.
+- Take edge cases from the wire format: the first and last value of each
+  compact form and one past each end; empty, chunked, and maximal strings and
+  binary; surrogate pairs and lone surrogates; `-0.0` and NaN; references to
+  self, to a value still being decoded, and out of range; truncation at every
+  byte; unknown tags; trailing data; nesting at `max_depth` and one past it.
+- Match the evidence to the claim: focused tests for behavior, golden bytes
+  from real peers for interoperability, Hypothesis and cargo-fuzz for hostile
+  input, and `benchmarks` for performance. A complexity bound may use a
+  generous time limit, commented as a bound rather than a benchmark.
+
+### Tests never justify defensive code
+
+Do not add guards, `isinstance` checks, broad `except` clauses, or fallbacks
+to the implementation so that a test can pass with an input the contract
+excludes. Fix the test instead.
+
+### How to write a test
+
+- Name the test as its claim, such as
+  `test_int_at_0x7ff_uses_the_two_byte_form`.
+- Keep tests straight-line, with arrange, act, and assert separated by blank
+  lines. One rule over many inputs is a `pytest.mark.parametrize` table, or
+  a Rust table of rows, with ids naming the form or boundary.
+- Write expected values as literals, and compare types too where the type is
+  part of the claim: `True == 1` and `1.0 == 1` hide bugs.
+- For errors, assert the specific exception and match, with
+  `match=re.escape(...)`, only what a caller relies on, such as a path like
+  `$.items[0]`, a class name, or a byte offset. Rust tests assert the error
+  kind and offset.
+- Put a test where its claim is owned:
+  - `crates/hessian2-core/tests/<topic>.rs` for wire forms, tags, lengths,
+    chunking, stream tables, and malformed bytes;
+  - `crates/hessian2-python/tests/test_<feature>.py` for the mapping between
+    Python and Hessian values, annotations, registration, callbacks, and
+    Python errors, without testing wire forms again;
+  - `crates/hessian2-python/tests/fixtures` for golden peer bytes, with their
+    provenance.
+- A regression test joins the file of the contract it protects, never one
+  named after an issue or review.
+
 ## Changes and review
 
 - Keep Python runtime code, stubs, tests, and README examples consistent.
-- Keep Python mapping in the binding and wire rules in the Rust core.
-- Both crates forbid unsafe code. Do not bypass input checks for speed.
 - Keep PRs focused; describe behavior changes and breaking changes.
 - Add regression tests for behavior changes, including failure paths.
 - Do not commit build output, downloaded jars, environments, or raw benchmark
