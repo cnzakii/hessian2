@@ -4,6 +4,8 @@ User-visible changes to hessian2 are recorded here.
 
 ## Unreleased
 
+## [0.2.1] - 2026-11-23
+
 ### Fixed
 
 - Python: `Reader.load` keeps each class definition's decoding plan between
