@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use hessian2_core::{Reader, ReaderState, Token, text};
 use pyo3::exceptions::PyTypeError;
@@ -78,12 +79,13 @@ impl As<'_> {
 }
 
 /// What a [`Decoder`] keeps between calls over one stream: the reader's
-/// position and tables, the values numbered for back-references, and the
-/// back-reference checks already made, with the types they name kept alive
-/// so their addresses stay theirs.
+/// position and tables, the plans for its class definitions, the values
+/// numbered for back-references, and the back-reference checks already
+/// made, with the types they name kept alive so their addresses stay theirs.
 #[derive(Default)]
 pub struct Saved {
     reader: ReaderState,
+    plans: Plans,
     refs: Vec<Option<Py<PyAny>>>,
     checked: AddressSet,
     types: AddressMap<Py<TypeObject>>,
@@ -111,9 +113,23 @@ impl Saved {
         self.expected
             .values()
             .flatten()
+            .try_for_each(|entry| visit.call(entry))?;
+        self.plans
+            .iter()
+            .flatten()
+            .filter_map(|(_, plan)| match &**plan {
+                Plan::Class { entry, .. }
+                | Plan::Enum { entry, .. }
+                | Plan::Converter { entry, .. } => Some(entry),
+                Plan::Value { .. } | Plan::Unknown { .. } => None,
+            })
             .try_for_each(|entry| visit.call(entry))
     }
 }
+
+/// The plan for each class definition, with the [`As::key`] it was made
+/// for. `Arc`, so a [`Saved`] can move between threads.
+type Plans = Vec<Option<(usize, Arc<Plan>)>>;
 
 /// Builds Python values from one Hessian stream, keeping the stream's
 /// reference numbering and class plans across the values in it.
@@ -126,9 +142,7 @@ pub struct Decoder<'a, 'py> {
     /// Values numbered for back-references; `None` while one is being built
     /// from its fields.
     refs: Vec<Option<Bound<'py, PyAny>>>,
-    /// The plan for each class definition, with the [`As::key`] it was
-    /// made for.
-    plans: Vec<Option<(usize, Rc<Plan>)>>,
+    plans: Plans,
     /// The codec, whose `_declared` method makes entries for classes
     /// declared with `hessian2.java_class` but not registered.
     codec: &'a Bound<'py, PyAny>,
@@ -376,6 +390,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
     ) -> Self {
         Self {
             reader: Reader::resume(input, saved.reader),
+            plans: saved.plans,
             refs: saved
                 .refs
                 .into_iter()
@@ -399,6 +414,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
     pub fn suspend(self) -> Saved {
         Saved {
             reader: self.reader.into_state(),
+            plans: self.plans,
             refs: self
                 .refs
                 .into_iter()
@@ -622,7 +638,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
     #[inline(never)]
     /// Returns how objects of a class definition are built as `mapped`,
     /// deciding on first use.
-    fn plan(&mut self, class: usize, mapped: As<'_>) -> PyResult<Rc<Plan>> {
+    fn plan(&mut self, class: usize, mapped: As<'_>) -> PyResult<Arc<Plan>> {
         if let Some(Some((key, plan))) = self.plans.get(class)
             && *key == mapped.key()
         {
@@ -650,7 +666,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 .get(&def.name)
                 .filter(|entry| matches!(entry.get().kind, Kind::Value(_))),
         };
-        let plan = Rc::new(match entry {
+        let plan = Arc::new(match entry {
             Some(entry) => match &entry.get().kind {
                 Kind::Class { fields, .. } | Kind::Tuple { fields } => {
                     // The common case needs neither an index nor name lookups.
