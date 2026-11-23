@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import time
 import typing
 
 import hessian2
 import pytest
 from assertions import same
-from hessian2 import Codec, DecodeError
+from hessian2 import Codec, DecodeError, HessianObject
 
 
 @hessian2.java_class("com.example.Address")
@@ -189,6 +190,22 @@ def test_reader_reference_validation_stays_bounded_across_load_calls():
     # A validation complexity bound, not a benchmark: the public getter counts
     # field walks, independently of CPU speed and the shared value's size.
     assert len(checks) == 1
+
+
+def test_reader_load_time_stays_linear_in_the_streams_class_definitions():
+    count = 100_000
+    data = hessian2.dumps_many(
+        [HessianObject(f"reader.C{i}", {"a": i}) for i in range(count)]
+    )
+    reader = Codec(unknown_class="hessian_object").reader(data)
+    started = time.perf_counter()
+
+    last = [reader.load() for _ in range(count)][-1]
+
+    # A complexity bound, not a benchmark: linear loads take about 0.1 s,
+    # and rebuilding per-class state for every earlier definition about 2.5 s.
+    assert time.perf_counter() - started < 1.0
+    assert last == HessianObject(f"reader.C{count - 1}", {"a": count - 1})
 
 
 def test_reader_checks_a_back_reference_against_a_later_loads_annotation():

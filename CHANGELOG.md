@@ -4,6 +4,13 @@ User-visible changes to hessian2 are recorded here.
 
 ## Unreleased
 
+### Fixed
+
+- Python: `Reader.load` keeps each class definition's decoding plan between
+  calls. Reading objects of many different classes one at a time took time
+  quadratic in their number: 16,000 took about 75 ms, against 6 ms with
+  `loads_many`. Both now take about the same time.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added
